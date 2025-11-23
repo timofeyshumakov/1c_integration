@@ -1214,9 +1214,10 @@ class EntityManager {
             $clientId = $this->createOrFindClientWithCachedData($cachedCard);
             
             $cardFields = [
-                'TITLE' => 'Карта ' . $cardNumber,
+                'TITLE' => $cardNumber,
                 'UF_CRM_3_1759320971349' => $cardNumber,
                 'UF_CRM_3_CLIENT' => $clientId,
+                'CONTACT_ID' => $clientId,
                 'UF_CRM_3_1759315419431' => $cachedCard['is_blocked'] ?? 0,
                 'UF_CRM_3_1760598978' => $cachedCard['client'] ?? $cardNumber,
                 'UF_CRM_3_1759317288635' => $this->dateManager->formatDate($cachedCard['application_date'] ?? $dealFields['UF_CRM_1760529583'] ?? ''),
@@ -1557,12 +1558,7 @@ class EntityManager {
     public function createDeal($entityFields){
         // Сначала создаем/находим связанные сущности
         $relatedEntities = $this->createOrFindRelatedEntities($entityFields);
-                $todayMinusThreeDays = date('Y-m-d', strtotime('-3 days'));
-                $stageId = "NEW";
-                if ($entityFields["date"] > $todayMinusThreeDays) {
-                    // Если да, устанавливаем STAGE_ID в "WON"
-                    $stageId = "WON";
-                }
+
 
         // Обновляем поля сделки с ID связанных сущностей
         $entityFields = $this->updateDealFieldsWithRelations($entityFields, $relatedEntities);
@@ -1789,9 +1785,10 @@ class EntityManager {
             $updateFields = [
                 'CONTACT_ID' => $contactId
             ];
-            
             $result = $deal->Update($dealId, $updateFields);
-            
+            print_r($result);
+            print_r('attachDealToContact');
+            print_r($updateFields);
             if ($result) {
                 $this->logger->logSuccess('deal_contact_attach', $dealId, "Сделка привязана к контакту", [
                     'deal_id' => $dealId,
@@ -1850,6 +1847,7 @@ class EntityManager {
                 'TITLE' => $cardNumber,
                 'UF_CRM_3_1759320971349' => $cardNumber,
                 'UF_CRM_3_CLIENT' => $clientId,
+                'CONTACT_ID' => $clientId,
                 'UF_CRM_3_1759315419431' => 0, // не заблокирована
                 'UF_CRM_3_1760598978' => $cardNumber,
                 'UF_CRM_3_1759317288635' => $this->dateManager->formatDate($dealFields['UF_CRM_1760529583'] ?? ''),
@@ -2249,9 +2247,11 @@ private function addProductToDeal($dealId, $product, $count, $price) {
                     $item["title"] = '';
                 }
 
-                $todayMinusThreeDays = date('Y-m-d', strtotime('-3 days'));
+                $todayMinusThreeDays = new DateTime(date('Y-m-d', strtotime('-3 days')));
+                $purchaseDate = new DateTime($item["date"]);
+
                 $stageId = "NEW";
-                if ($entityFields["date"] > $todayMinusThreeDays) {
+                if ($purchaseDate < $todayMinusThreeDays) {
                     // Если да, устанавливаем STAGE_ID в "WON"
                     $stageId = "WON";
                 }
@@ -2315,6 +2315,7 @@ private function addProductToDeal($dealId, $product, $count, $price) {
                     'TITLE' => $item["number"] ?? 'Без названия',
                     'UF_CRM_3_1759320971349' => $item["number"] ?? '',
                     'UF_CRM_3_CLIENT' => $clientId ?? '',
+                    
                     'UF_CRM_3_1759315419431' => $item["is_blocked"] ?? 0,
                     'UF_CRM_3_1760598978' => $item["client"] ?? 0,
                     'UF_CRM_3_1759317288635' => $this->dateManager->formatDate($item["application_date"] ?? ''),
@@ -2871,9 +2872,11 @@ function createDealWithMultipleProducts($purchasesGroup, $entityManager, $logger
                 } elseif ((int)$firstPurchase["sum"] < 0) {
                     $firstPurchase["title"] = 'Возврат №' . $firstPurchase["receipt_number"] . ' от ' . $dateManager->formatDate($firstPurchase["date"]);
                 }
-                $todayMinusThreeDays = date('Y-m-d', strtotime('-3 days'));
+                $todayMinusThreeDays = new DateTime(date('Y-m-d', strtotime('-3 days')));
+                $purchaseDate = new DateTime($firstPurchase["date"]);
+
                 $stageId = "NEW";
-                if ($entityFields["date"] > $todayMinusThreeDays) {
+                if ($purchaseDate < $todayMinusThreeDays) {
                     // Если да, устанавливаем STAGE_ID в "WON"
                     $stageId = "WON";
                 }
@@ -3214,6 +3217,7 @@ private function createCardFromApiData($apiCardData, $clientId) {
             'TITLE' => $apiCardData['number'] ?? 'Карта из API',
             'UF_CRM_3_1759320971349' => $apiCardData['number'] ?? '',
             'UF_CRM_3_CLIENT' => $clientId,
+            'CONTACT_ID' => $clientId,
             'UF_CRM_3_1759315419431' => $apiCardData['is_blocked'] ?? 0,
             'UF_CRM_3_1760598978' => $apiCardData['client'] ?? $apiCardData['number'] ?? '',
             'UF_CRM_3_1759317288635' => $dateManager->formatDate($apiCardData['application_date'] ?? ''),
@@ -3299,7 +3303,7 @@ private function findCardByClientId($clientId) {
             if ($dealId) {
                 // Привязываем сделку к клиенту
                 $this->attachDealToContact($dealId, $clientId);
-                
+
                 $this->logger->logSuccess('client_deal', $entityId, $dealId, [
                     'client_id' => $clientId,
                     'receipt_number' => $entityId,
@@ -3349,8 +3353,10 @@ private function findCardByClientId($clientId) {
                 'CONTACT_ID' => $contactId
             ];
             
-            $result = $deal->Update($dealId, $updateFields);
-            
+            $result = $deal->Update($dealId, $updateFields, true, true);
+            print_r($result);
+            print_r($contactId);
+            print_r('$contactId');
             if ($result) {
                 $this->logger->logSuccess('deal_contact_attach', $dealId, "Сделка привязана к контакту", [
                     'deal_id' => $dealId,
@@ -3399,7 +3405,7 @@ private function findCardByClientId($clientId) {
         foreach ($apiClients as $clientData) {
             $clientCode = $clientData['code'] ?? 'unknown';
             echo $clientCode;
-            if ($clientCode != '00000068901') {
+            if ($clientCode != '00000048131') {
                 echo '$clientCode';
                 continue;
             }
@@ -3439,7 +3445,7 @@ private function findCardByClientId($clientId) {
         
         // Отправляем уведомления об изменениях
         $this->sendSyncNotifications($results);
-        
+        countClientsSumm();
         return $results;
     }
 
@@ -3625,13 +3631,14 @@ private function findCardByClientId($clientId) {
      */
     private function updateClient($clientId, $updateFields) {
         try {
+
 $arMessageFields = array(
     // получатель
     "TO_USER_ID" => 3,
     // отправитель
     "FROM_USER_ID" => 3, 
     // тип уведомления
-    "NOTIFY_TYPE" => 'IM_NOTIFY_CONFIRM',
+    "NOTIFY_TYPE" => 1,
     // текст уведомления на сайте (доступен html и бб-коды)
     "NOTIFY_MESSAGE" => "Приглашаю вас принять участие во встрече “Мгновенные сообщения и уведомления” которая состоится 15.03.2012 в 14:00",
 
@@ -3645,6 +3652,7 @@ $arMessageFields = array(
     // символьный код шаблона отправки письма, если не задавать отправляется шаблоном уведомлений
     "NOTIFY_EMAIL_TEMPLATE" => "CALENDAR_INVITATION",
 );
+
 if(CModule::IncludeModule("im")){
     CIMNotify::Add($arMessageFields);
 }
@@ -3722,6 +3730,7 @@ if(CModule::IncludeModule("im")){
             'TITLE' => $cardData['number'],
             'UF_CRM_3_1759320971349' => $cardData['number'],
             'UF_CRM_3_CLIENT' => $clientId,
+            'CONTACT_ID' => $clientId,
             'UF_CRM_3_1759315419431' => $cardData['is_blocked'] ?? 0,
             'UF_CRM_3_1760598978' => $cardData['client'] ?? $cardData['number'],
             'UF_CRM_3_1759317288635' => $dateManager->formatDate($cardData['application_date'] ?? ''),
@@ -4031,75 +4040,171 @@ if(CModule::IncludeModule("im")){
      * Находит и создает сделки для ВСЕХ карт клиента
      */
     private function findAndCreateDealsForAllClientCards($clientId, $clientCode) {
-        try {
-            $logger = new JsonLogger();
-            $entityManager = new EntityManager(new DateManager(), new ImageProcessor(), $logger);
-            
-            echo "🔍 Ищем покупки для всех карт клиента: {$clientCode}\n";
-            
-            // Получаем все номера карт клиента
-            $allCardNumbers = $this->getAllOrCreateCardsForClient($clientId, $clientCode);
-            
-            if (empty($allCardNumbers)) {
-                echo "ℹ️ Не найдено карт для клиента: {$clientCode}\n";
-                return;
-            }
-            
-            echo "✅ Найдено карт для клиента: " . count($allCardNumbers) . "\n";
-            
-            // Получаем все покупки из API
-            $allPurchases = $this->fetchAllPurchasesFromApi();
-            
-            // Фильтруем покупки по ВСЕМ номерам карт клиента
-            $clientPurchases = $this->filterPurchasesByMultipleCardNumbers($allPurchases, $allCardNumbers);
-            
-            if (empty($clientPurchases)) {
-                echo "ℹ️ Не найдено покупок для карт клиента: " . implode(', ', $allCardNumbers) . "\n";
-                return;
-            }
+    try {
+        $logger = new JsonLogger();
+        $entityManager = new EntityManager(new DateManager(), new ImageProcessor(), $logger);
+        
+        echo "🔍 Ищем покупки для всех карт клиента: {$clientCode}\n";
+        
+        // Получаем все номера карт клиента
+        $allCardNumbers = $this->getAllOrCreateCardsForClient($clientId, $clientCode);
+        
+        if (empty($allCardNumbers)) {
+            echo "ℹ️ Не найдено карт для клиента: {$clientCode}\n";
+            return;
+        }
+        
+        echo "✅ Найдено карт для клиента: " . count($allCardNumbers) . "\n";
+        
+        // Получаем все покупки из API
+        $allPurchases = $this->fetchAllPurchasesFromApi();
+        
+        // Фильтруем покупки по ВСЕМ номерам карт клиента
+        $clientPurchases = $this->filterPurchasesByMultipleCardNumbers($allPurchases, $allCardNumbers);
+        
+        if (empty($clientPurchases)) {
+            echo "ℹ️ Не найдено покупок для карт клиента: " . implode(', ', $allCardNumbers) . "\n";
+            return;
+        }
 
-            echo "✅ Найдено покупок для создания сделок: " . count($clientPurchases) . "\n";
+        echo "✅ Найдено покупок для создания сделок: " . count($clientPurchases) . "\n";
+        
+        // РАЗДЕЛЯЕМ ПОКУПКИ НА ОБЫЧНЫЕ И НАЧАЛЬНЫЙ ОСТАТОК
+        $regularPurchases = [];
+        $initialBalancePurchases = [];
+        
+        foreach ($clientPurchases as $purchase) {
+            $itemName = $purchase['item_name'] ?? '';
+            $receiptNumber = $purchase['receipt_number'] ?? '';
+            $cardNumber = $purchase['card_number'] ?? '';
+            $sum = $purchase['sum'] ?? 0;
+
+            // Определяем тип покупки
+            if (empty($itemName) && !empty($cardNumber) && $sum != 0) {
+                $initialBalancePurchases[] = $purchase;
+            } else {
+                $regularPurchases[] = $purchase;
+            }
+        }
+        
+        echo "📊 Статистика покупок для клиента {$clientCode}:\n";
+        echo "  - Обычные покупки с товарами: " . count($regularPurchases) . "\n";
+        echo "  - Сделки начального остатка: " . count($initialBalancePurchases) . "\n";
+        
+        $totalCreatedDeals = 0;
+        
+        // 1. ОБРАБАТЫВАЕМ ОБЫЧНЫЕ ПОКУПКИ С ТОВАРАМИ
+        if (!empty($regularPurchases)) {
+            echo "🛒 Обрабатываю обычные покупки с товарами...\n";
             
             // Создаем товары если их нет
-            $productCreationResults = createMissingProductsFromPurchases($clientPurchases, $entityManager, $logger);
+            $productCreationResults = createMissingProductsFromPurchases($regularPurchases, $entityManager, $logger);
             
             // Группируем покупки по номеру чека и дате
-            $groupedPurchases = groupPurchasesByReceipt($clientPurchases);
+            $groupedPurchases = groupPurchasesByReceipt($regularPurchases);
             
-            echo "📦 Сгруппировано чеков: " . count($groupedPurchases) . "\n";
-            
-            $createdDeals = 0;
+            echo "📦 Сгруппировано чеков с товарами: " . count($groupedPurchases) . "\n";
             
             // Создаем сделки для каждой группы покупок
             foreach ($groupedPurchases as $receiptKey => $purchasesGroup) {
                 $dealId = $this->createDealForClient($purchasesGroup, $clientId);
                 
                 if ($dealId) {
-                    $createdDeals++;
-                    echo "  ✅ Создана сделка: {$dealId} для чека {$receiptKey}\n";
+                    $totalCreatedDeals++;
+                    echo "  ✅ Создана сделка с товарами: {$dealId} для чека {$receiptKey}\n";
                 } else {
-                    echo "  ❌ Ошибка создания сделки для чека {$receiptKey}\n";
+                    echo "  ❌ Ошибка создания сделки с товарами для чека {$receiptKey}\n";
                 }
             }
-
-            $this->logger->logSuccess('client_deals', $clientId, "Создано сделок: {$createdDeals}", [
+        }
+        
+        // 2. ОБРАБАТЫВАЕМ СДЕЛКИ НАЧАЛЬНОГО ОСТАТКА
+        if (!empty($initialBalancePurchases)) {
+            echo "💰 Обрабатываю сделки начального остатка...\n";
+            
+            $dateManager = new DateManager();
+            $initialBalanceResults = [
+                'created' => [],
+                'errors' => []
+            ];
+            
+            foreach ($initialBalancePurchases as $purchase) {
+                $receiptNumber = $purchase['receipt_number'] ?? 'unknown';
+                $cardNumber = $purchase['card_number'] ?? '';
+                $sum = $purchase['sum'] ?? 0;
+                
+                try {
+                    echo "  📝 Обрабатываю сделку начального остатка: {$receiptNumber}, карта: {$cardNumber}, сумма: {$sum}\n";
+                    
+                    // Создаем сделку "внесение начального остатка"
+                    $dealId = createInitialBalanceDeal($purchase, $entityManager, $dateManager);
+                    
+                    if ($dealId) {
+                        $totalCreatedDeals++;
+                        $initialBalanceResults['created'][] = [
+                            'receipt_number' => $receiptNumber,
+                            'deal_id' => $dealId,
+                            'card_number' => $cardNumber,
+                            'sum' => $sum
+                        ];
+                        echo "  ✅ Создана сделка начального остатка: {$dealId} для карты {$cardNumber}\n";
+                    } else {
+                        $initialBalanceResults['errors'][] = [
+                            'receipt_number' => $receiptNumber,
+                            'error' => 'Ошибка создания сделки'
+                        ];
+                        echo "  ❌ Ошибка создания сделки начального остатка для чека {$receiptNumber}\n";
+                    }
+                    
+                } catch (Exception $e) {
+                    $initialBalanceResults['errors'][] = [
+                        'receipt_number' => $receiptNumber,
+                        'error' => $e->getMessage()
+                    ];
+                    echo "  ❌ Исключение при создании сделки начального остатка для чека {$receiptNumber}: " . $e->getMessage() . "\n";
+                }
+            }
+            
+            echo "  📊 Результаты создания сделок начального остатка:\n";
+            echo "    - Создано: " . count($initialBalanceResults['created']) . "\n";
+            echo "    - Ошибок: " . count($initialBalanceResults['errors']) . "\n";
+            
+            // Логируем результаты сделок начального остатка
+            $logger->logGeneralError('client_initial_balance_deals', $clientId, "Созданы сделки начального остатка для клиента", [
                 'client_id' => $clientId,
                 'client_code' => $clientCode,
-                'card_numbers' => $allCardNumbers,
-                'total_purchases' => count($clientPurchases),
-                'grouped_receipts' => count($groupedPurchases),
-                'deals_created' => $createdDeals
+                'total_initial_balance_purchases' => count($initialBalancePurchases),
+                'created' => count($initialBalanceResults['created']),
+                'errors' => count($initialBalanceResults['errors']),
+                'results' => $initialBalanceResults
             ]);
-
-            echo "🎯 Итог: создано {$createdDeals} сделок для клиента {$clientId} (по " . count($allCardNumbers) . " картам)\n";
-
-        } catch (Exception $e) {
-            $this->logger->logGeneralError('client_deals', $clientId, "Ошибка создания сделок для клиента: " . $e->getMessage(), [
-                'client_code' => $clientCode
-            ]);
-            echo "❌ Ошибка при создании сделок для клиента: " . $e->getMessage() . "\n";
         }
+
+        $this->logger->logSuccess('client_deals', $clientId, "Создано сделок: {$totalCreatedDeals}", [
+            'client_id' => $clientId,
+            'client_code' => $clientCode,
+            'card_numbers' => $allCardNumbers,
+            'total_purchases' => count($clientPurchases),
+            'regular_purchases' => count($regularPurchases),
+            'initial_balance_purchases' => count($initialBalancePurchases),
+            'deals_created' => $totalCreatedDeals,
+            'deal_types' => [
+                'regular' => count($regularPurchases),
+                'initial_balance' => count($initialBalancePurchases)
+            ]
+        ]);
+
+        echo "🎯 Итог для клиента {$clientCode}: создано {$totalCreatedDeals} сделок (по " . count($allCardNumbers) . " картам)\n";
+        echo "   - Обычные сделки с товарами: " . (count($regularPurchases) - count($initialBalancePurchases)) . "\n";
+        echo "   - Сделки начального остатка: " . count($initialBalancePurchases) . "\n";
+
+    } catch (Exception $e) {
+        $this->logger->logGeneralError('client_deals', $clientId, "Ошибка создания сделок для клиента: " . $e->getMessage(), [
+            'client_code' => $clientCode
+        ]);
+        echo "❌ Ошибка при создании сделок для клиента: " . $e->getMessage() . "\n";
     }
+}
 
     /**
      * Фильтрует покупки по нескольким номерам карт
@@ -4360,11 +4465,24 @@ function createInitialBalanceDeals($purchases) {
         $receiptNumber = $purchase['receipt_number'] ?? '';
         $cardNumber = $purchase['card_number'] ?? '';
         $sum = $purchase['sum'] ?? 0;
-        
+        $purchaseDateString = $dateManager->formatDate($purchase['date']) ?? '';
+
         if (empty($itemName) && !empty($receiptNumber) && !empty($cardNumber) && $sum != 0) {
             try {
                 echo "📝 Обрабатываю покупку без товара: {$receiptNumber}, карта: {$cardNumber}, сумма: {$sum}\n";
+                $existingDeal = findExistingInitialBalanceDeal($cardNumber, $purchaseDateString);
                 
+                if ($existingDeal) {
+                    $results['existing'][] = [
+                        'receipt_number' => $receiptNumber,
+                        'deal_id' => $existingDeal['ID'],
+                        'card_number' => $cardNumber,
+                        'sum' => $sum,
+                        'date' => $purchaseDateString
+                    ];
+                    echo "  ➡️ Сделка начального остатка уже существует: {$existingDeal['ID']}\n";
+                    continue;
+                }
                 // Создаем сделку "внесение начального остатка"
                 $dealId = createInitialBalanceDeal($purchase, $entityManager, $dateManager);
                 
@@ -4408,6 +4526,28 @@ function createInitialBalanceDeals($purchases) {
     
     return $results;
 }
+/**
+ * Ищет существующую сделку начального остатка по номеру карты и дате
+ */
+function findExistingInitialBalanceDeal($cardNumber, $purchaseDate) {
+    try {
+
+        $deals = DealTable::getList([
+            'filter' => [
+                '=UF_CRM_1761200496' => $cardNumber, // Поле с номером карты
+                '=UF_CRM_1760529583' => $purchaseDate, // Поле с датой покупки
+            ],
+            'select' => ['ID', 'TITLE', 'UF_CRM_1761200496', 'UF_CRM_1760529583'],
+            'limit' => 1
+        ])->fetchAll();
+
+        return !empty($deals) ? $deals[0] : null;
+
+    } catch (Exception $e) {
+        error_log("Ошибка при поиске существующей сделки начального остатка для карты {$cardNumber}: " . $e->getMessage());
+        return null;
+    }
+}
 
 /**
  * Создает сделку "внесение начального остатка"
@@ -4416,15 +4556,21 @@ function createInitialBalanceDeal($purchase, $entityManager, $dateManager) {
     $receiptNumber = $purchase['receipt_number'] ?? 'unknown';
     $cardNumber = $purchase['card_number'] ?? '';
     $sum = $purchase['sum'] ?? 0;
-    
-    // Определяем тип операции по сумме
-    $operationType = $sum > 0 ? 'пополнение' : 'списание';
-    
+    $purchaseDateSting = $dateManager->formatDate($purchase['date']) ?? '';
+
+    $existingDeal = findExistingInitialBalanceDeal($cardNumber, $purchaseDateSting);
+    if ($existingDeal) {
+        echo "  ➡️ Сделка начального остатка уже существует: {$existingDeal['ID']} для карты {$cardNumber} от {$purchaseDateSting}\n";
+        return $existingDeal['ID'];
+    }
+
     // Создаем название для сделки
     $dealTitle = "Внесение начального остатка по карте {$cardNumber}";
-                $todayMinusThreeDays = date('Y-m-d', strtotime('-3 days'));
+                $todayMinusThreeDays = new DateTime(date('Y-m-d', strtotime('-3 days')));
+                $purchaseDate = new DateTime($purchase["date"]);
+
                 $stageId = "NEW";
-                if ($entityFields["date"] > $todayMinusThreeDays) {
+                if ($purchaseDate < $todayMinusThreeDays) {
                     // Если да, устанавливаем STAGE_ID в "WON"
                     $stageId = "WON";
                 }
@@ -4436,7 +4582,7 @@ function createInitialBalanceDeal($purchase, $entityManager, $dateManager) {
             'UF_CRM_1761785330' => abs($sum),
             'UF_CRM_1756711109104' => $receiptNumber,
             'UF_CRM_1756711204935' => $purchase['register'] ?? '',
-            'UF_CRM_1760529583' => $dateManager->formatDate($purchase['date'] ?? ''),
+            'UF_CRM_1760529583' => $purchaseDateSting,
             'UF_CRM_1756713651' => $purchase['warehouse_code'] ?? '',
             'UF_CRM_1761200403' => $purchase['warehouse_code'] ?? '',
             'UF_CRM_1761200470' => $purchase['cashier_code'] ?? '',
@@ -4453,15 +4599,6 @@ function createInitialBalanceDeal($purchase, $entityManager, $dateManager) {
         $dealId = $entityManager->createDeal($entityFields);
         
         if ($dealId) {
-            // Логируем успешное создание
-            $entityManager->getLogger()->logSuccess('initial_balance_deal', $receiptNumber, $dealId, [
-                'receipt_number' => $receiptNumber,
-                'card_number' => $cardNumber,
-                'sum' => $sum,
-                'operation_type' => $operationType,
-                'deal_title' => $dealTitle
-            ]);
-            
             return $dealId;
         }
         
@@ -4518,21 +4655,7 @@ function processClientsSync() {
     return $results;
 }
 
-if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
-    
-} elseif(strpos($_SERVER['REQUEST_URI'], 'action=update') !== false){
-    processClientsSync();
-    // Проверяем наличие параметра date
-    if(isset($_REQUEST['date']) && !empty($_REQUEST['date'])) {
-        $timestamp = $_REQUEST['date'];
-        $fromDate = new DateTime();
-        $fromDate->setTimestamp($timestamp);
-        print_r('fromDate');
-        print_r($fromDate);
-       // processRecentPurchases($fromDate);
-    } else {
-    }
-} elseif(strpos($_SERVER['REQUEST_URI'], 'action=count') !== false){
+function countClientsSumm(){
 $currentDate = new DateTime();
 $oneYearAgo = (new DateTime())->modify('-1 year');
 
@@ -4704,6 +4827,24 @@ echo "<pre>";
 print_r($result);
 echo "</pre>";
 	//changeAssigned($_REQUEST['seller'], $_REQUEST['deal_id']);
+}
+
+if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
+    
+} elseif(strpos($_SERVER['REQUEST_URI'], 'action=update') !== false){
+    processClientsSync();
+    // Проверяем наличие параметра date
+    if(isset($_REQUEST['date']) && !empty($_REQUEST['date'])) {
+        $timestamp = $_REQUEST['date'];
+        $fromDate = new DateTime();
+        $fromDate->setTimestamp($timestamp);
+        print_r('fromDate');
+        print_r($fromDate);
+       // processRecentPurchases($fromDate);
+    } else {
+    }
+} elseif(strpos($_SERVER['REQUEST_URI'], 'action=count') !== false){
+    countClientsSumm();
 } else {
     $result = fetchAllData();
 
