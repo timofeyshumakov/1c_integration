@@ -5,6 +5,349 @@ use \Bitrix\Main,
     \Bitrix\Crm\DealTable;
 require_once (__DIR__.'/lib/app/crest.php');
 
+class ContactChangesTracker {
+    private $changesFile;
+    private $logger;
+    
+    public function __construct($changesFile = __DIR__.'/logs/changes_tracker.json', JsonLogger $logger = null) {
+        $this->changesFile = $changesFile;
+        $this->logger = $logger ?: new JsonLogger();
+        $this->ensureChangesFileExists();
+    }
+    
+    /**
+     * Создает файл отслеживания изменений если он не существует
+     */
+    private function ensureChangesFileExists() {
+        if (!file_exists($this->changesFile)) {
+            file_put_contents($this->changesFile, json_encode([], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+        }
+    }
+    
+    /**
+     * Загружает изменения из файла
+     */
+    private function loadChanges() {
+        if (!file_exists($this->changesFile)) {
+            return [];
+        }
+        
+        $content = file_get_contents($this->changesFile);
+        return json_decode($content, true) ?: [];
+    }
+    
+    /**
+     * Сохраняет изменения в файл
+     */
+    private function saveChanges($changes) {
+        return file_put_contents($this->changesFile, json_encode($changes, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    }
+    
+    /**
+     * Генерирует уникальный ID для изменения
+     */
+    private function generateChangeId($contactId, $field, $newValue) {
+        return md5($contactId . '_' . $field . '_' . $newValue . '_' . time());
+    }
+    
+    /**
+     * Проверяет существование дублирующего изменения
+     */
+    private function isDuplicateChange($contactId, $field, $newValue) {
+        $changes = $this->loadChanges();
+        
+        foreach ($changes as $change) {
+            if ($change['contact_id'] == $contactId && 
+                $change['field'] == $field && 
+                $change['new_value'] == $newValue &&
+                $change['status'] == 'pending') {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Регистрирует изменение контакта
+     */
+    public function registerContactChange($contactId, $field, $oldValue, $newValue, $changedBy = 'system') {
+        // Пропускаем пустые изменения
+        if ($oldValue === $newValue) {
+            return false;
+        }
+        
+        // Проверяем дублирование
+        if ($this->isDuplicateChange($contactId, $field, $newValue)) {
+            $this->logger->logGeneralError('contact_change', $contactId, "Дублирующее изменение пропущено", [
+                'field' => $field,
+                'old_value' => $oldValue,
+                'new_value' => $newValue
+            ]);
+            return false;
+        }
+        
+        $changes = $this->loadChanges();
+        $change = [
+            'contact_id' => $contactId,
+            'field' => $field,
+            'field_name' => $this->getFieldDisplayName($field),
+            'old_value' => $oldValue,
+            'new_value' => $newValue,
+            'changed_by' => $changedBy,
+            'status' => 'pending', // pending, approved, rejected
+            'approved_by' => null,
+            'created_at' => date('Y-m-d H:i:s'),
+            'updated_at' => date('Y-m-d H:i:s')
+        ];
+
+        // Отправляем уведомление в чат
+        $changeId = $this->sendChangeNotification($change);
+        $change['change_id'] = $changeId;
+
+        $changes[] = $change;
+        
+        if ($this->saveChanges($changes)) {
+            $this->logger->logSuccess('contact_change', $contactId, "Изменение зарегистрировано: {$changeId}", [
+                'field' => $field,
+                'old_value' => $oldValue,
+                'new_value' => $newValue
+            ]);
+            return $changeId;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Получает отображаемое имя поля
+     */
+    private function getFieldDisplayName($field) {
+        $fieldNames = [
+            'NAME' => 'Имя',
+            'LAST_NAME' => 'Фамилия',
+            'SECOND_NAME' => 'Отчество',
+            'PHONE' => 'Телефон',
+            'EMAIL' => 'Email',
+            'BIRTHDATE' => 'Дата рождения',
+            'UF_CRM_1760599281' => 'Код клиента'
+        ];
+        
+        return $fieldNames[$field] ?? $field;
+    }
+    
+    /**
+     * Форматирует значение для отображения
+     */
+    private function formatValueForDisplay($value, $field) {
+        if (is_array($value)) {
+            return implode(', ', array_column($value, 'VALUE'));
+        }
+        
+        if (empty($value)) {
+            return '(пусто)';
+        }
+        
+        return $value;
+    }
+    
+    /**
+     * Отправляет уведомление об изменении в чат
+     */
+    private function sendChangeNotification($change) {
+        $contactId = $change['contact_id'];
+        $fieldName = $change['field_name'];
+        $oldValue = $this->formatValueForDisplay($change['old_value'], $change['field']);
+        $newValue = $this->formatValueForDisplay($change['new_value'], $change['field']);
+        $changeId = $change['change_id'];
+        
+        $message = "🔄 Изменение контакта #{$contactId}\n";
+        $message .= "📋 Поле: {$fieldName}\n";
+        $message .= "📝 Было: {$oldValue}\n";
+        $message .= "✏️ Стало: {$newValue}\n";
+        $message .= "Подтвердите изменение:";
+        
+        $buttons = [
+            [
+                'TITLE' => '✅ Подтвердить',
+                'VALUE' => "approve_{$changeId}",
+                'TYPE' => 'accept'
+            ],
+            [
+                'TITLE' => '❌ Отклонить', 
+                'VALUE' => "reject_{$changeId}",
+                'TYPE' => 'cancel'
+            ]
+        ];
+        
+        return $this->sendBitrixNotification($message, $buttons, 3, $contactId); // Отправляем администратору (ID=1)
+    }
+    
+    /**
+     * Отправляет уведомление в Bitrix24
+     */
+    private function sendBitrixNotification($message, $buttons = [], $userId = 3, $contactId) {
+        if (!CModule::IncludeModule("im")) {
+            error_log("Модуль IM не подключен");
+            return false;
+        }
+        
+        $arMessageFields = [
+            "TO_USER_ID" => 78,
+            "FROM_USER_ID" => 0, // Системное уведомление
+            "NOTIFY_TYPE" => 1,
+            "NOTIFY_TAG" => "change_contact",
+            "NOTIFY_MODULE" => "im",
+            "NOTIFY_MESSAGE" => $message,
+            "NOTIFY_BUTTONS" => $buttons
+        ];
+        
+        try {
+            $messageId = CIMNotify::Add($arMessageFields);
+            return $messageId;
+        } catch (Exception $e) {
+            error_log("Ошибка отправки уведомления: " . $e->getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * Обновляет статус изменения
+     */
+    public function updateChangeStatus($changeId, $status, $approvedBy = 'system') {
+        $changes = $this->loadChanges();
+        $updated = false;
+        
+        foreach ($changes as &$change) {
+            if ($change['change_id'] === $changeId) {
+                $change['status'] = $status;
+                $change['approved_by'] = $approvedBy;
+                $change['updated_at'] = date('Y-m-d H:i:s');
+                $updated = true;
+                break;
+            }
+        }
+        
+        if ($updated) {
+            $this->saveChanges($changes);
+            
+            // Отправляем уведомление о результате
+            $this->sendStatusNotification($changeId, $status, $approvedBy);
+            
+            return true;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Отправляет уведомление о результате подтверждения
+     */
+    private function sendStatusNotification($changeId, $status, $approvedBy) {
+        $changes = $this->loadChanges();
+        $change = null;
+        
+        foreach ($changes as $ch) {
+            if ($ch['change_id'] === $changeId) {
+                $change = $ch;
+                break;
+            }
+        }
+        
+        if (!$change) {
+            return;
+        }
+        
+        $statusText = $status === 'approved' ? 'подтверждено' : 'отклонено';
+        $emoji = $status === 'approved' ? '✅' : '❌';
+        
+        $message = "{$emoji} Изменение контакта #{$change['contact_id']} {$statusText}\n";
+        $message .= "📋 Поле: {$change['field_name']}\n";
+        $message .= "✏️ Значение: {$this->formatValueForDisplay($change['new_value'], $change['field'])}\n";
+        $message .= "👤 Подтверждено: {$approvedBy}\n";
+        $message .= "⏰ Время: " . date('d.m.Y H:i:s');
+        
+        $this->sendBitrixNotification($message, [], 1);
+    }
+    
+    /**
+     * Получает ожидающие изменения для контакта
+     */
+    public function getPendingChanges($contactId) {
+        $changes = $this->loadChanges();
+        $pendingChanges = [];
+        
+        foreach ($changes as $change) {
+            if ($change['contact_id'] == $contactId && $change['status'] == 'pending') {
+                $pendingChanges[] = $change;
+            }
+        }
+        
+        return $pendingChanges;
+    }
+    
+    /**
+     * Применяет подтвержденные изменения к контакту
+     */
+    public function applyApprovedChanges($contactId) {
+        $changes = $this->loadChanges();
+        $appliedChanges = [];
+        
+        foreach ($changes as $change) {
+            if ($change['contact_id'] == $contactId && $change['status'] == 'approved') {
+                if ($this->applyContactChange($change)) {
+                    $appliedChanges[] = $change['change_id'];
+                }
+            }
+        }
+        
+        return $appliedChanges;
+    }
+    
+    /**
+     * Применяет одно изменение к контакту
+     */
+    private function applyContactChange($change) {
+        try {
+            $contact = new \CCrmContact(false);
+            $updateFields = [
+                $change['field'] => $change['new_value']
+            ];
+            
+            $result = $contact->Update($change['contact_id'], $updateFields, true, true);
+            
+            if ($result) {
+                // Помечаем изменение как примененное
+                $this->markChangeAsApplied($change['change_id']);
+                return true;
+            }
+            
+            return false;
+            
+        } catch (Exception $e) {
+            error_log("Ошибка применения изменения контакта: " . $e->getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * Помечает изменение как примененное
+     */
+    private function markChangeAsApplied($changeId) {
+        $changes = $this->loadChanges();
+        
+        foreach ($changes as &$change) {
+            if ($change['change_id'] === $changeId) {
+                $change['status'] = 'applied';
+                $change['updated_at'] = date('Y-m-d H:i:s');
+                break;
+            }
+        }
+        
+        $this->saveChanges($changes);
+    }
+}
+
 class DealRelationManager {
     private $entityManager;
     private $logger;
@@ -1263,7 +1606,6 @@ class EntityManager {
             // Ищем существующего клиента
             $factory = Service\Container::getInstance()->getFactory(\CCrmOwnerType::Contact);
             if (!$factory) {
-                print_r('lol');
                 return null;
             }
 
@@ -1564,13 +1906,26 @@ class EntityManager {
         $entityFields = $this->updateDealFieldsWithRelations($entityFields, $relatedEntities);
 
         // Создаем сделку
-        $entityObject = new \CCrmDeal(false);
+        //$entityObject = new \CCrmDeal(false);
+        $assigned = CRest::call(
+            'user.get',
+            [
+                'UF_USR_1761980389716' => $entityFields["UF_CRM_1761200470"]
+            ]
+        )["result"][0]["ID"];
+        if(!empty($assigned)){
+            $entityFields["ASSIGNED_BY_ID"] = $assigned;
+        }
 
-        $entityId = $entityObject->Add(
-            $entityFields,
-            true, // $bUpdateSearch
-            []    // $arOptions
-        );
+
+        $entityId = CRest::call(
+            'crm.deal.add',
+            [
+                'FIELDS' => $entityFields
+            ]
+        )["result"];
+                print_r('s1924');
+                print_r($entityId);
         $result = CRest::call(
             'bizproc.workflow.start',
             [
@@ -1582,12 +1937,8 @@ class EntityManager {
                 ],
             ]
         );
+                print_r($result);
         if (!$entityId) {
-            if (method_exists($entityObject, 'GetLAST_ERROR')) {
-                error_log("Ошибка при создании сделки: " . $entityObject->GetLAST_ERROR());
-            } else {
-                error_log("Ошибка при создании сделки");
-            }
             return false;
         }
 
@@ -1672,6 +2023,8 @@ class EntityManager {
             print_r($contactFields);
             $contact = new \CCrmContact(false);
             $contactId = $contact->Add($contactFields, true);
+            print_r('$contactId');
+            print_r($contactId);
 
             if ($contactId) {
                 // ПОИСК И ПРИВЯЗКА СДЕЛОК К КОНТАКТУ
@@ -2881,6 +3234,7 @@ function createDealWithMultipleProducts($purchasesGroup, $entityManager, $logger
                     $stageId = "WON";
                 }
     try {
+
         // Подготавливаем поля для создания сделки
         $entityFields = [
                     'TITLE' => $firstPurchase["title"],
@@ -2983,7 +3337,8 @@ function createDealWithMultipleProducts($purchasesGroup, $entityManager, $logger
 }
 function filterRecentPurchases($purchases, $fromDate) {
     $recentPurchases = [];
-
+    print_r($purchases);
+    print_r($fromDate);
     foreach ($purchases as $purchase) {
         if (empty($purchase['date'])) {
             continue;
@@ -2995,7 +3350,8 @@ function filterRecentPurchases($purchases, $fromDate) {
         if ($purchaseDate === false) {
             continue;
         }
-
+        print_r($purchaseDate);
+        print_r($purchaseDate >= $fromDate);
         // Проверяем, находится ли дата в пределах последних 3 минут
         if ($purchaseDate >= $fromDate) {
             $recentPurchases[] = $purchase;
@@ -3047,10 +3403,12 @@ function changeAssigned($seller, $dealId) {
 class ClientSyncManager {
     private $entityManager;
     private $logger;
-    
+    private $changesTracker;
+
     public function __construct(EntityManager $entityManager, JsonLogger $logger = null) {
         $this->entityManager = $entityManager;
         $this->logger = $logger ?: new JsonLogger();
+        $this->changesTracker = new ContactChangesTracker(__DIR__.'/logs/changes_tracker.json', $logger);
     }
 
 /**
@@ -3355,8 +3713,10 @@ private function findCardByClientId($clientId) {
             
             $result = $deal->Update($dealId, $updateFields, true, true);
             print_r($result);
-            print_r($contactId);
             print_r('$contactId');
+            print_r($contactId);
+            print_r('$dealId');
+            print_r($dealId);
             if ($result) {
                 $this->logger->logSuccess('deal_contact_attach', $dealId, "Сделка привязана к контакту", [
                     'deal_id' => $dealId,
@@ -3404,11 +3764,14 @@ private function findCardByClientId($clientId) {
         
         foreach ($apiClients as $clientData) {
             $clientCode = $clientData['code'] ?? 'unknown';
-            echo $clientCode;
-            if ($clientCode != '00000048131') {
-                echo '$clientCode';
-                continue;
+
+            if($clientCode == "00000101709"){
+               // $clientData['middle_name'] = 'test';
+
+            }else{
+
             }
+
             try {
                 // Синхронизируем клиента
                 $syncResult = $this->syncSingleClient($clientData);
@@ -3442,9 +3805,7 @@ private function findCardByClientId($clientId) {
                 echo "❌ Ошибка клиента {$clientCode}: " . $e->getMessage() . "\n";
             }
         }
-        
-        // Отправляем уведомления об изменениях
-        $this->sendSyncNotifications($results);
+
         countClientsSumm();
         return $results;
     }
@@ -3454,11 +3815,34 @@ private function findCardByClientId($clientId) {
      */
     private function findClientByCode($clientCode) {
         try {
-            $factory = Service\Container::getInstance()->getFactory(\CCrmOwnerType::Contact);
-            if (!$factory) {
-                return null;
+            $client = CRest::call(
+                'crm.contact.list',
+                [
+                    'FILTER' => [
+                        'UF_CRM_1760599281' => $clientCode,
+                    ],
+                    'ORDER' => [
+                        'ID' => 'DESC',
+                    ],
+                    'SELECT' => [
+                        'ID',
+                        'NAME',
+                        'LAST_NAME',
+                        'SECOND_NAME',
+                        'EMAIL',
+                        'PHONE',
+                        'BIRTHDATE',
+                    ]
+                ]
+            )["result"][0];
+
+            if(!empty($client)){
+                $client["PHONE"] = $client["PHONE"][0]["VALUE"];
+                $client["EMAIL"] = $client["EMAIL"][0]["VALUE"];
             }
 
+            return $client;
+/*
             $items = $factory->getItems([
                 'filter' => [
                     'UF_CRM_1760599281' => $clientCode, //UF_CRM_1760599281
@@ -3472,12 +3856,12 @@ private function findCardByClientId($clientId) {
                 return [
                     'id' => $client->getId(),
                     'SECOND_NAME' => $client->getSecondName(),
-                    'phone' => $client->getPhone(),
-                    'email' => $client->getEmail(),
+                    'PHONE' => $client->getPhone(),
+                    'EMAIL' => $client->getEmail(),
                     'NAME' => $client->getName()
                 ];
             }
-
+*/
             return null;
             
         } catch (Exception $e) {
@@ -3491,38 +3875,40 @@ private function findCardByClientId($clientId) {
      */
     private function updateClientIfChanged($existingClient, $newClientData) {
         $changes = $this->detectClientChanges($existingClient, $newClientData);
-                print_r($changes);
-                print_r($existingClient);
+        $contactId = $existingClient['ID'];
+        
         if (empty($changes)) {
             return [
                 'status' => 'no_changes',
-                'bitrix_id' => $existingClient['id'],
+                'bitrix_id' => $contactId,
                 'client_code' => $newClientData['code'],
                 'changes' => []
             ];
         }
         
-        // Обновляем клиента
-        $updateFields = $this->prepareClientUpdateFields($newClientData, $changes);
-
-        $result = $this->updateClient($existingClient['id'], $updateFields);
-        
-        if ($result) {
-            $this->logger->logSuccess('client', $newClientData['code'], $existingClient['id'], [
-                'action' => 'updated',
-                'changes' => $changes,
-                'client_data' => $newClientData
-            ]);
+        // Регистрируем изменения вместо немедленного обновления
+        $registeredChanges = [];
+        foreach ($changes as $field => $changeData) {
+            $changeId = $this->changesTracker->registerContactChange(
+                $contactId,
+                $field,
+                $changeData['from'],
+                $changeData['to'],
+                'api_sync'
+            );
             
-            return [
-                'status' => 'updated',
-                'bitrix_id' => $existingClient['id'],
-                'client_code' => $newClientData['code'],
-                'changes' => $changes
-            ];
-        } else {
-            throw new Exception("Не удалось обновить клиента");
+            if ($changeId) {
+                $registeredChanges[$field] = $changeId;
+            }
         }
+        
+        return [
+            'status' => 'changes_registered',
+            'bitrix_id' => $contactId,
+            'client_code' => $newClientData['code'],
+            'changes' => $registeredChanges,
+            'registered_changes_count' => count($registeredChanges)
+        ];
     }
     
     /**
@@ -3530,34 +3916,44 @@ private function findCardByClientId($clientId) {
      */
     private function detectClientChanges($existingClient, $newClientData) {
         $changes = [];
-        
+        $dateManager = new DateManager();
+
         // Проверяем имя
         $newName = trim($newClientData['name'] ?? '');
         $existingName = trim($existingClient['name'] ?? '');
-        if ($newName !== $existingName) {
-            $changes['name'] = ['from' => $existingName, 'to' => $newName];
+        if ($newName !== $existingName && $existingName !== '') {
+            $changes['NAME'] = ['from' => $existingName, 'to' => $newName];
         }
 
         $newMiddleName = trim($newClientData['middle_name'] ?? '');
         $existingMiddleName = trim($existingClient['SECOND_NAME'] ?? '');
-        if ($newMiddleName !== $existingMiddleName) {
-            $changes['middle_name'] = ['from' => $existingMiddleName, 'to' => $newMiddleName];
+        if ($newMiddleName !== $existingMiddleName && $existingMiddleName !== '') {
+            $changes['SECOND_NAME'] = ['from' => $existingMiddleName, 'to' => $newMiddleName];
         }
 
         // Проверяем телефон
-        $newPhone = $this->normalizePhone($newClientData['phone'] ?? '');
-        $existingPhone = $this->normalizePhone($existingClient['phone'] ?? '');
-        if ($newPhone !== $existingPhone) {
-            $changes['phone'] = ['from' => $existingPhone, 'to' => $newPhone];
+        $newPhone = $this->normalizePhone($newClientData['mobile_phone'] ?? '');
+        $existingPhone = $this->normalizePhone($existingClient['PHONE'] ?? '');
+        if ($newPhone !== $existingPhone && $existingPhone !== '') {
+            $changes['PHONE'] = ['from' => $existingPhone, 'to' => $newPhone];
         }
         
         // Проверяем email
         $newEmail = strtolower(trim($newClientData['email'] ?? ''));
-        $existingEmail = strtolower(trim($existingClient['email'] ?? ''));
-        if ($newEmail !== $existingEmail) {
-            $changes['email'] = ['from' => $existingEmail, 'to' => $newEmail];
+        $existingEmail = strtolower(trim($existingClient['EMAIL'] ?? ''));
+        if ($newEmail !== $existingEmail && $existingEmail !== '') {
+            $changes['EMAIL'] = ['from' => $existingEmail, 'to' => $newEmail];
         }
-        
+
+        // Проверяем дату рождения
+        $newBirthDate = $dateManager->formatDate(explode(" ", $newClientData['birth_date'])[0]) ?? '';
+        $existingBirthDate = $dateManager->formatDate(explode("T", $existingClient['BIRTHDATE'])[0]) ?? '';
+        print_r($newBirthDate);
+        print_r($existingBirthDate);
+        if ($newBirthDate !== $existingBirthDate && $existingBirthDate !== '') {
+            $changes['BIRTHDATE'] = ['from' => $existingBirthDate, 'to' => $newBirthDate];
+        }
+
         return $changes;
     }
     
@@ -3587,6 +3983,9 @@ private function findCardByClientId($clientId) {
                 'LAST_NAME' => $clientData['last_name'] ?? '',
                 'SECOND_NAME' => $clientData['middle_name'] ?? '',
                 'UF_CRM_1760599281' => $clientData["code"],
+                'UF_CRM_1756711548791' => $genderValue,
+                'BIRTHDATE' => $dateManager->formatDate($clientData['birth_date'] ?? ''),
+                'ADDRESS' => $clientData["address"] ?? '',
                 'FM' => [//почта, телефон
                     'EMAIL' => [
                         'n0' => ['VALUE' => $clientData["email"], 'VALUE_TYPE' => 'WORK']
@@ -3634,14 +4033,14 @@ private function findCardByClientId($clientId) {
 
 $arMessageFields = array(
     // получатель
-    "TO_USER_ID" => 3,
+    "TO_USER_ID" => 78,
     // отправитель
-    "FROM_USER_ID" => 3, 
+    "FROM_USER_ID" => 0, 
     // тип уведомления
     "NOTIFY_TYPE" => 1,
     // текст уведомления на сайте (доступен html и бб-коды)
     "NOTIFY_MESSAGE" => "Приглашаю вас принять участие во встрече “Мгновенные сообщения и уведомления” которая состоится 15.03.2012 в 14:00",
-
+    "NOTIFY_MODULE" => "im",
     // массив описывающий кнопки уведомления
     // в вашем модуле yourmodule в классе CYourModuleEvents в методе CYourModuleEventsIMCallback пишем функцию обработку события
     "NOTIFY_BUTTONS" => Array(
@@ -3854,57 +4253,7 @@ if(CModule::IncludeModule("im")){
         
         return [];
     }
-    
-    /**
-     * Отправляет уведомления о результатах синхронизации
-     */
-    private function sendSyncNotifications($results) {
-        $message = $this->prepareNotificationMessage($results);
-        $this->sendBitrixNotification($message);
-    }
-    
-    /**
-     * Подготавливает сообщение для уведомления
-     */
-    private function prepareNotificationMessage($results) {
-        $createdCount = count($results['created']);
-        $updatedCount = count($results['updated']);
-        $errorsCount = count($results['errors']);
-        $cardsCount = count($results['cards_processed']);
-        
-        $message = "🔄 Синхронизация клиентов завершена\n\n";
-        $message .= "✅ Создано клиентов: {$createdCount}\n";
-        $message .= "🔄 Обновлено клиентов: {$updatedCount}\n";
-        $message .= "🃏 Обработано карт: {$cardsCount}\n";
-        $message .= "❌ Ошибок: {$errorsCount}\n";
-        
-        if ($errorsCount > 0) {
-            $message .= "\nПоследние ошибки:\n";
-            $errorExamples = array_slice($results['errors'], 0, 3);
-            foreach ($errorExamples as $error) {
-                $message .= "• {$error['client_code']}: {$error['error']}\n";
-            }
-        }
-        
-        return $message;
-    }
 
-    /**
-     * Отправляет уведомление в Bitrix24
-     */
-    private function sendBitrixNotification($message) {
-        try {
-            // Отправляем уведомление администратору
-            $result = CRest::call('im.notify', [
-                'to' => 3, // ID администратора, можно изменить
-                'message' => $message,
-                'type' => 'SYSTEM'
-            ]);
-            
-        } catch (Exception $e) {
-            error_log("Ошибка отправки Bitrix уведомления: " . $e->getMessage());
-        }
-    }
     /**
      * Получает все карты клиента из API
      */
@@ -4137,7 +4486,7 @@ if(CModule::IncludeModule("im")){
                     echo "  📝 Обрабатываю сделку начального остатка: {$receiptNumber}, карта: {$cardNumber}, сумма: {$sum}\n";
                     
                     // Создаем сделку "внесение начального остатка"
-                    $dealId = createInitialBalanceDeal($purchase, $entityManager, $dateManager);
+                    $dealId = createInitialBalanceDeal($purchase, $entityManager, $dateManager, $clientId);
                     
                     if ($dealId) {
                         $totalCreatedDeals++;
@@ -4227,6 +4576,7 @@ if(CModule::IncludeModule("im")){
      * Создает нового клиента со всеми картами
      */
     private function createNewClient($clientData) {
+
         $clientFields = $this->prepareClientFields($clientData);
         $clientId = $this->entityManager->createContact($clientFields);
         
@@ -4252,23 +4602,33 @@ if(CModule::IncludeModule("im")){
      */
     private function syncSingleClient($clientData) {
         $clientCode = $clientData['code'] ?? 'unknown';
-        
+
         // Ищем существующего клиента
         $existingClient = $this->findClientByCode($clientCode);
-        
-        if (!$existingClient) {
+
+        // Правильная проверка существования клиента
+        if (empty($existingClient) || empty($existingClient["ID"])) {
             // Создаем нового клиента со всеми картами
-            return $this->createNewClient($clientData);
+            $newClient = $this->createNewClient($clientData);
+            if(!empty($newClient)){
+                $this->findAndCreateDealsForAllClientCards($newClient['bitrix_id'], $clientCode);
+            }
+
+            return $newClient;
         } else {
-            // Обновляем клиента и синхронизируем все карты
             $syncResult = $this->updateClientIfChanged($existingClient, $clientData);
+            return $syncResult;
+            /*
+            // Обновляем клиента и синхронизируем все карты
+            
             
             // После обновления клиента синхронизируем все его карты и сделки
             if ($syncResult['status'] !== 'error') {
                 $this->findAndCreateDealsForAllClientCards($existingClient['id'], $clientCode);
             }
             
-            return $syncResult;
+            
+            */
         }
     }
 
@@ -4552,7 +4912,7 @@ function findExistingInitialBalanceDeal($cardNumber, $purchaseDate) {
 /**
  * Создает сделку "внесение начального остатка"
  */
-function createInitialBalanceDeal($purchase, $entityManager, $dateManager) {
+function createInitialBalanceDeal($purchase, $entityManager, $dateManager, $contactId = null) {
     $receiptNumber = $purchase['receipt_number'] ?? 'unknown';
     $cardNumber = $purchase['card_number'] ?? '';
     $sum = $purchase['sum'] ?? 0;
@@ -4594,7 +4954,9 @@ function createInitialBalanceDeal($purchase, $entityManager, $dateManager) {
             // Добавляем специальное поле для отметки, что это сделка начального остатка
             'UF_CRM_1763617811' => 'Y' // Предполагаемое пользовательское поле
         ];
-
+        if ($contactId !== null) {
+            $entityFields['CONTACT_ID'] = $contactId;
+        }
         // Создаем сделку
         $dealId = $entityManager->createDeal($entityFields);
         
@@ -4667,7 +5029,7 @@ $arSelect = array(
    "OPPORTUNITY",
    "CONTACT_ID",
    "DATE_CREATE"
-);        
+);
 $arDeals = DealTable::getList([
    'order'=>['ID' => 'DESC'],
    'filter'=>$arFilter,
@@ -4812,25 +5174,63 @@ foreach($allContactsData as $contactData) {
 
     // Обновляем контакт
     $updateResult = $oContact->Update($contactId, $arFields);
-    
-    if (!$updateResult) {
-        // Обработка ошибки обновления
-        echo "Ошибка при обновлении контакта ID: " . $contactId . "<br>";
-    }
 }
 
-// Выводим статистику для информации
-echo "Обработано контактов со сделками: " . count($result) . "<br>";
-echo "Обработано контактов без сделок: " . count($contactsWithoutDeals) . "<br>";
-echo "Всего обработано контактов: " . count($allContactsData) . "<br>";
 echo "<pre>";
 print_r($result);
 echo "</pre>";
 	//changeAssigned($_REQUEST['seller'], $_REQUEST['deal_id']);
 }
 
+/**
+ * Обрабатывает подтверждение изменений контакта
+ */
+function processContactChangeApproval() {
+    if (isset($_REQUEST['change_action']) && isset($_REQUEST['change_id'])) {
+        $changeAction = $_REQUEST['change_action'];
+        $changeId = $_REQUEST['change_id'];
+        $approvedBy = $_REQUEST['user_id'] ?? 1; // ID пользователя, можно получить из контекста
+        
+        $changesTracker = new ContactChangesTracker();
+        
+        $status = '';
+        if (strpos($changeAction, 'approve') === 0) {
+            $status = 'approved';
+        } elseif (strpos($changeAction, 'reject') === 0) {
+            $status = 'rejected';
+        }
+        
+        if ($status) {
+            $result = $changesTracker->updateChangeStatus($changeId, $status, $approvedBy);
+            
+            if ($result && $status === 'approved') {
+                // Немедленно применяем изменение
+                $changes = $changesTracker->loadChanges();
+                $contactId = null;
+                foreach ($changes as $change) {
+                    if ($change['change_id'] === $changeId) {
+                        $contactId = $change['contact_id'];
+                        break;
+                    }
+                }
+                
+                if ($contactId) {
+                    $changesTracker->applyApprovedChanges($contactId);
+                }
+            }
+            
+            echo json_encode(['success' => $result, 'status' => $status]);
+        } else {
+            echo json_encode(['success' => false, 'error' => 'Invalid action']);
+        }
+        
+        exit;
+    }
+}
+
 if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
-    
+    processContactChangeApproval(); // Обработка подтверждений изменений
+    processClientsSync(); // Синхронизация клиентов
 } elseif(strpos($_SERVER['REQUEST_URI'], 'action=update') !== false){
     processClientsSync();
     // Проверяем наличие параметра date
@@ -4840,7 +5240,7 @@ if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
         $fromDate->setTimestamp($timestamp);
         print_r('fromDate');
         print_r($fromDate);
-       // processRecentPurchases($fromDate);
+        processRecentPurchases($fromDate);
     } else {
     }
 } elseif(strpos($_SERVER['REQUEST_URI'], 'action=count') !== false){
@@ -4854,8 +5254,6 @@ echo "</pre>";
 	//main();
 }
 
-
 //$client = new ApiClient($api_username, $api_password, $api_base_url);
 //$itemsResult = $client->makeRequest('clients/changes&message_number=256832', 'DELETE',);
-
 ?>
