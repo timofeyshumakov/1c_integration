@@ -160,8 +160,9 @@ class ContactChangesTracker {
         $oldValue = $this->formatValueForDisplay($change['old_value'], $change['field']);
         $newValue = $this->formatValueForDisplay($change['new_value'], $change['field']);
         $changeId = $change['change_id'];
-        
-        $message = "🔄 Изменение контакта #{$contactId}\n";
+        $message = '🔄 Изменение контакта ';
+        $message .= '<a href="https://b24.trimiata.ru/crm/contact/details/' . $change['contact_id'] . '/">#' . $contactId . '</a>';
+        $message .= "\n";
         $message .= "📋 Поле: {$fieldName}\n";
         $message .= "📝 Было: {$oldValue}\n";
         $message .= "✏️ Стало: {$newValue}\n";
@@ -193,7 +194,7 @@ class ContactChangesTracker {
         }
         
         $arMessageFields = [
-            "TO_USER_ID" => 78,
+            "TO_USER_ID" => 36,
             "FROM_USER_ID" => 0, // Системное уведомление
             "NOTIFY_TYPE" => 1,
             "NOTIFY_TAG" => "change_contact",
@@ -2668,7 +2669,7 @@ private function addProductToDeal($dealId, $product, $count, $price) {
                     'TITLE' => $item["number"] ?? 'Без названия',
                     'UF_CRM_3_1759320971349' => $item["number"] ?? '',
                     'UF_CRM_3_CLIENT' => $clientId ?? '',
-                    
+                    'CONTACT_ID' => $clientId,
                     'UF_CRM_3_1759315419431' => $item["is_blocked"] ?? 0,
                     'UF_CRM_3_1760598978' => $item["client"] ?? 0,
                     'UF_CRM_3_1759317288635' => $this->dateManager->formatDate($item["application_date"] ?? ''),
@@ -3637,13 +3638,15 @@ private function findCardByClientId($clientId) {
         if (empty($purchasesGroup)) {
             return false;
         }
+        $dateManager = new DateManager();
 
         $firstPurchase = $purchasesGroup[0];
         $entityId = $firstPurchase["receipt_number"] ?? 'unknown';
-        
+        $sellDate = $dateManager->formatDate($firstPurchase["date"] ?? '');
+
         try {
             // Проверяем, не существует ли уже сделка с таким номером чека
-            $existingDeal = $this->findDealByReceiptNumber($entityId);
+            $existingDeal = $this->findDealByReceiptNumber($entityId, $sellDate);
             if ($existingDeal) {
                 echo "  ➡️  Сделка уже существует для чека {$entityId} (ID: {$existingDeal['ID']})\n";
                 
@@ -3683,16 +3686,17 @@ private function findCardByClientId($clientId) {
     /**
      * Ищет сделку по номеру чека
      */
-    private function findDealByReceiptNumber($receiptNumber) {
+    private function findDealByReceiptNumber($receiptNumber, $sellDate) {
         try {
             $deals = DealTable::getList([
                 'filter' => [
-                    '=UF_CRM_1756711109104' => $receiptNumber // Поле с номером чека
+                    '=UF_CRM_1756711109104' => $receiptNumber, // Поле с номером чека
+                    '=UF_CRM_1760529583' => $sellDate
                 ],
                 'select' => ['ID', 'TITLE', 'UF_CRM_1756711109104', 'CONTACT_ID'],
                 'limit' => 1
             ])->fetchAll();
-
+                print_r($deals);
             return !empty($deals) ? $deals[0] : null;
 
         } catch (Exception $e) {
@@ -3761,10 +3765,22 @@ private function findCardByClientId($clientId) {
         }
         
         echo "Получено клиентов из API: " . count($apiClients) . "\n";
-        
+            $bxClientsCount = CRest::call(
+                'crm.contact.list',
+                [
+                    'FILTER' => [],
+                    'ORDER' => [
+                        'ID' => 'DESC',
+                    ],
+                    'SELECT' => [
+                        'ID',
+                    ]
+                ]
+            )["total"];
+            $create = count($apiClients) > $bxClientsCount;
+
         foreach ($apiClients as $clientData) {
             $clientCode = $clientData['code'] ?? 'unknown';
-
             if($clientCode == "00000101709"){
                // $clientData['middle_name'] = 'test';
 
@@ -3774,7 +3790,7 @@ private function findCardByClientId($clientId) {
 
             try {
                 // Синхронизируем клиента
-                $syncResult = $this->syncSingleClient($clientData);
+                $syncResult = $this->syncSingleClient($clientData, $create);
                 print_r($syncResult);
                 if ($syncResult['status'] === 'created') {
                     $results['created'][] = $syncResult;
@@ -3786,12 +3802,9 @@ private function findCardByClientId($clientId) {
                 } elseif ($syncResult['status'] === 'no_changes') {
                     echo "➡️  Без изменений: {$clientCode}\n";
                 }
-                
-                // Обрабатываем карты этого клиента
-                if (!empty($clientData['cards'])) {
-                    $cardResults = $this->syncClientCards($clientData['cards'], $syncResult['bitrix_id']);
-                    $results['cards_processed'] = array_merge($results['cards_processed'], $cardResults);
-                }
+
+                $cardResults = $this->syncClientCards($clientData['cards'], $syncResult['bitrix_id']);
+                $results['cards_processed'] = array_merge($results['cards_processed'], $cardResults);
                 
             } catch (Exception $e) {
                 $errorResult = [
@@ -3982,6 +3995,7 @@ private function findCardByClientId($clientId) {
                 'NAME' => $clientData['first_name'] ?? 'Клиент по карте ' . $clientData["code"],
                 'LAST_NAME' => $clientData['last_name'] ?? '',
                 'SECOND_NAME' => $clientData['middle_name'] ?? '',
+                'ASSIGNED_BY_ID' => 3,
                 'UF_CRM_1760599281' => $clientData["code"],
                 'UF_CRM_1756711548791' => $genderValue,
                 'BIRTHDATE' => $dateManager->formatDate($clientData['birth_date'] ?? ''),
@@ -4374,6 +4388,7 @@ if(CModule::IncludeModule("im")){
             }
             
             $card->set('UF_CRM_3_CLIENT', $clientId);
+            $card->set('CONTACT_ID', $clientId);
             $operation = $factory->getUpdateOperation($card);
             $operationResult = $operation->launch();
             
@@ -4579,7 +4594,7 @@ if(CModule::IncludeModule("im")){
 
         $clientFields = $this->prepareClientFields($clientData);
         $clientId = $this->entityManager->createContact($clientFields);
-        
+
         if ($clientId) {
             $clientCode = $clientData['code'] ?? 'unknown';
             
@@ -4596,11 +4611,74 @@ if(CModule::IncludeModule("im")){
             throw new Exception("Не удалось создать клиента");
         }
     }
+    private function findActiveCardsForContactInBitrix($contactId) {
+        try {
+            $factory = Service\Container::getInstance()->getFactory(1038);
+            
+            if (!$factory) {
+                return [];
+            }
+            
+            // Ищем карты с условиями:
+            // 1. Привязаны к контакту (UF_CRM_3_CLIENT = $contactId)
+            // 2. Не заблокированы (UF_CRM_3_1759315419431 = 'N')
+            $items = $factory->getItems([
+                'filter' => [
+                    '=UF_CRM_3_CLIENT' => $contactId,
+                    '=UF_CRM_3_1759315419431' => 'N' // N - не заблокирована
+                ],
+                'select' => ['ID', 'UF_CRM_3_1759320971349'],
+                'order' => ['ID' => 'DESC']
+            ]);
+            
+            $activeCards = [];
+            foreach ($items as $item) {
+                return [
+                    'ID' => $item->getId(),
+                    'NUMBER' => $item->get('UF_CRM_3_1759320971349')
+                ];
+            }
 
+        } catch (Exception $e) {
+            error_log("Ошибка при поиске активных карт для контакта {$contactId}: " . $e->getMessage());
+            return [];
+        }
+    }
+    private function updateActiveCardForExistingClient($contactId, $clientCode) {
+        try {
+            // 1. Проверяем текущую активную карту в Bitrix
+            $currentActiveCards = $this->findActiveCardsForContactInBitrix($contactId);
+            // 3. Проверяем текущее значение поля контакта
+            $contactData = $this->findClientByCode($clientCode);
+            $currentCardField = $contactData['UF_CRM_1764916739'] ?? null;
+            
+            // 4. Определяем какую карту установить
+            $cardNumberToSet = null;
+            $cardNumberToSet = $currentActiveCards['NUMBER'];
+            
+            // 5. Обновляем поле если нужно
+            if ($cardNumberToSet) {
+                $card = $this->findCardByNumber($cardNumberToSet);
+                
+                if ($card && $currentCardField != $card['id']) {
+                    $this->updateContactWithActiveCard($contactId, $cardNumberToSet);
+                }
+            } elseif ($currentCardField) {
+                // Если нет активных карт, но поле заполнено - очищаем его
+                $this->clearContactCardField($contactId);
+            }
+            
+        } catch (Exception $e) {
+            $this->logger->logGeneralError('update_active_card', $contactId, "Ошибка обновления активной карты: " . $e->getMessage(), [
+                'client_code' => $clientCode
+            ]);
+            echo "  ⚠️  Ошибка обновления активной карты: " . $e->getMessage() . "\n";
+        }
+    }
     /**
      * Синхронизирует одного клиента со всеми его картами
      */
-    private function syncSingleClient($clientData) {
+    private function syncSingleClient($clientData, $create) {
         $clientCode = $clientData['code'] ?? 'unknown';
 
         // Ищем существующего клиента
@@ -4608,13 +4686,16 @@ if(CModule::IncludeModule("im")){
 
         // Правильная проверка существования клиента
         if (empty($existingClient) || empty($existingClient["ID"])) {
-            // Создаем нового клиента со всеми картами
-            $newClient = $this->createNewClient($clientData);
-            if(!empty($newClient)){
-                $this->findAndCreateDealsForAllClientCards($newClient['bitrix_id'], $clientCode);
+            if($create){
+                // Создаем нового клиента со всеми картами
+                $newClient = $this->createNewClient($clientData);
+                if(!empty($newClient)){
+                    $this->findAndCreateDealsForAllClientCards($newClient['bitrix_id'], $clientCode);
+                    $this->updateActiveCardForExistingClient($newClient['bitrix_id'], $clientCode);
+                }
+                return $newClient;
             }
 
-            return $newClient;
         } else {
             $syncResult = $this->updateClientIfChanged($existingClient, $clientData);
             return $syncResult;
@@ -4644,7 +4725,7 @@ if(CModule::IncludeModule("im")){
             
             $items = $factory->getItems([
                 'filter' => [
-                    '=UF_CRM_3_CLIENT' => $clientId
+                    '=CONTACT_ID' => $clientId
                 ],
                 'select' => ['ID', 'UF_CRM_3_1759320971349']
             ]);
@@ -5016,170 +5097,191 @@ function processClientsSync() {
     
     return $results;
 }
-
 function countClientsSumm(){
-$currentDate = new DateTime();
-$oneYearAgo = (new DateTime())->modify('-1 year');
+    $currentDate = new DateTime();
+    $oneYearAgo = (new DateTime())->modify('-1 year');
 
-// Получаем все сделки
-$arFilter = array();            
-$arSelect = array(
-   "ID",
-   "UF_CRM_1760529583",
-   "OPPORTUNITY",
-   "CONTACT_ID",
-   "DATE_CREATE"
-);
-$arDeals = DealTable::getList([
-   'order'=>['ID' => 'DESC'],
-   'filter'=>$arFilter,
-   'select'=>$arSelect,
-])->fetchAll();
-
-$result = [];
-$contactsWithDeals = []; // Массив для хранения ID контактов, у которых есть сделки
-
-// Переменные для общих сумм
-$totalOpportunityAll = 0;
-$totalDealsCountAll = 0;
-
-foreach($arDeals as $deal){
-    $contactId = $deal['CONTACT_ID'];
+    // Получаем все сделки
+    $arFilter = array();            
+    $arSelect = array(
+        "ID",
+        "UF_CRM_1760529583", // Дата сделки
+        "UF_CRM_1764868525", // Количество изделий в сделке
+        "OPPORTUNITY",
+        "CONTACT_ID",
+        "DATE_CREATE"
+    );
     
-    // Добавляем контакт в список контактов со сделками
-    $contactsWithDeals[$contactId] = true;
-    
-    $date = $deal["UF_CRM_1760529583"]->toString();
-    $dealDate = new DateTime($date);
-    
-    // Обновляем общие суммы
-    $totalOpportunityAll += $deal['OPPORTUNITY'];
-    $totalDealsCountAll++;
-    
-    if (!isset($result[$contactId])) {
-        $result[$contactId] = [
-            'CONTACT_ID' => $contactId,
-            'TOTAL_OPPORTUNITY' => 0,
-            'TOTAL_OPPORTUNITY_YEAR' => 0,
-            'DEALS_COUNT' => 0,
-            'DEALS_COUNT_YEAR' => 0,
-            'LAST_PURCHASE_DATE' => $date
-        ];
-    }
-    
-    // Общая сумма покупок
-    $result[$contactId]['TOTAL_OPPORTUNITY'] += $deal['OPPORTUNITY'];
-    $result[$contactId]['DEALS_COUNT']++;
-    
-    // Сумма покупок за последний год
-    if ($dealDate >= $oneYearAgo) {
-        $result[$contactId]['TOTAL_OPPORTUNITY_YEAR'] += $deal['OPPORTUNITY'];
-        $result[$contactId]['DEALS_COUNT_YEAR']++;
-    }
-    
-    // Самая поздняя дата покупки
-    if (strtotime($date) > strtotime($result[$contactId]['LAST_PURCHASE_DATE'])) {
-        $result[$contactId]['LAST_PURCHASE_DATE'] = $date;
-    }
-}
+    $arDeals = DealTable::getList([
+        'order'=>['ID' => 'DESC'],
+        'filter'=>$arFilter,
+        'select'=>$arSelect,
+    ])->fetchAll();
 
-// Получаем все контакты, чтобы найти тех, у кого нет сделок
-$allContacts = CCrmContact::GetListEx(
-    [],
-    [],
-    false,
-    false,
-    ['ID']
-);
+    $result = [];
+    $contactsWithDeals = []; // Массив для хранения ID контактов, у которых есть сделки
 
-$contactsWithoutDeals = [];
-while ($contact = $allContacts->Fetch()) {
-    $contactId = $contact['ID'];
-    // Если контакта нет в массиве контактов со сделками, добавляем его в список контактов без сделок
-    if (!isset($contactsWithDeals[$contactId])) {
-        $contactsWithoutDeals[$contactId] = [
-            'CONTACT_ID' => $contactId,
-            'TOTAL_OPPORTUNITY' => 0,
-            'TOTAL_OPPORTUNITY_YEAR' => 0,
-            'DEALS_COUNT' => 0,
-            'DEALS_COUNT_YEAR' => 0,
-            'LAST_PURCHASE_DATE' => null
-        ];
-    }
-}
-
-// Объединяем контакты со сделками и без сделок
-$allContactsData = $result + $contactsWithoutDeals;
-
-// Форматируем результат и добавляем поле в зависимости от суммы
-foreach($allContactsData as &$contactData) {
-    // Определяем поле в зависимости от суммы
-    $totalOpportunity = $contactData['TOTAL_OPPORTUNITY'];
-    if ($totalOpportunity < 1000000) {
-        $contactData['SUMM_LIST'] = 55;
-    } elseif ($totalOpportunity >= 1000000 && $totalOpportunity < 5000000) {
-        $contactData['SUMM_LIST'] = 56;
-    } else {
-        $contactData['SUMM_LIST'] = 57; // или другое значение по умолчанию для сумм от 3 миллионов и выше
+    foreach($arDeals as $deal){
+        $contactId = $deal['CONTACT_ID'];
+        
+        // Добавляем контакт в список контактов со сделками
+        $contactsWithDeals[$contactId] = true;
+        
+        $date = $deal["UF_CRM_1760529583"]->toString();
+        $dealDate = new DateTime($date);
+        
+        // Получаем количество изделий из сделки (поле UF_CRM_1764868525)
+        $itemCount = (float)$deal['UF_CRM_1764868525'] ?: 0;
+        
+        if (!isset($result[$contactId])) {
+            $result[$contactId] = [
+                'CONTACT_ID' => $contactId,
+                'TOTAL_OPPORTUNITY' => 0,
+                'TOTAL_OPPORTUNITY_YEAR' => 0,
+                'DEALS_COUNT' => 0,
+                'DEALS_COUNT_YEAR' => 0,
+                'TOTAL_ITEMS' => 0,          // Общее количество изделий
+                'TOTAL_ITEMS_YEAR' => 0,     // Количество изделий за последний год
+                'LAST_PURCHASE_DATE' => $date
+            ];
+        }
+        
+        // Общая сумма покупок
+        $result[$contactId]['TOTAL_OPPORTUNITY'] += $deal['OPPORTUNITY'];
+        $result[$contactId]['DEALS_COUNT']++;
+        
+        // Общее количество изделий
+        $result[$contactId]['TOTAL_ITEMS'] += $itemCount;
+        
+        // Сумма покупок за последний год
+        if ($dealDate >= $oneYearAgo) {
+            $result[$contactId]['TOTAL_OPPORTUNITY_YEAR'] += $deal['OPPORTUNITY'];
+            $result[$contactId]['DEALS_COUNT_YEAR']++;
+            $result[$contactId]['TOTAL_ITEMS_YEAR'] += $itemCount; // Количество изделий за год
+        }
+        
+        // Самая поздняя дата покупки
+        if (strtotime($date) > strtotime($result[$contactId]['LAST_PURCHASE_DATE'])) {
+            $result[$contactId]['LAST_PURCHASE_DATE'] = $date;
+        }
     }
 
-    // Форматируем сумму покупок за год или ставим "-"
-    if ($contactData['DEALS_COUNT_YEAR'] > 0) {
-        $contactData['TOTAL_OPPORTUNITY_YEAR_FORMATTED'] = number_format(
-            floor($contactData['TOTAL_OPPORTUNITY_YEAR']), 
-            0, '', ' '
-        );
-        $contactData['DEALS_COUNT_YEAR_FORMATTED'] = $contactData['DEALS_COUNT_YEAR'];
-    } else {
-        $contactData['TOTAL_OPPORTUNITY_YEAR_FORMATTED'] = '-';
-        $contactData['DEALS_COUNT_YEAR_FORMATTED'] = '-'; // Если посещений 0, ставим "-"
-    }
-    
-    if ($contactData['DEALS_COUNT'] > 0) {
-        $contactData['TOTAL_OPPORTUNITY_FORMATTED'] = number_format(
-            floor($contactData['TOTAL_OPPORTUNITY']), 
-            0, '', ' '
-        );
-        $contactData['DEALS_COUNT_FORMATTED'] = $contactData['DEALS_COUNT'];
-    } else {
-        $contactData['TOTAL_OPPORTUNITY_FORMATTED'] = '-';
-        $contactData['DEALS_COUNT'] = '-'; // Если посещений 0, ставим "-"
-    }
-    
-    // Форматируем дату последней покупки (убираем время)
-    if ($contactData['LAST_PURCHASE_DATE']) {
-        $lastPurchaseDate = new DateTime($contactData['LAST_PURCHASE_DATE']);
-        $contactData['LAST_PURCHASE_DATE_FORMATTED'] = $lastPurchaseDate->format('d.m.Y');
-    } else {
-        $contactData['LAST_PURCHASE_DATE_FORMATTED'] = '-'; // Для контактов без сделок
-    }
-}
-
-$allContactsData = array_values($allContactsData);
-
-
-// Обновляем все контакты
-$oContact = new CCrmContact(false);
-foreach($allContactsData as $contactData) {
-    $contactId = $contactData['CONTACT_ID'];
-
-    $arFields = array(
-        "UF_CRM_1763617810" => $contactData['TOTAL_OPPORTUNITY_YEAR_FORMATTED'], // Сумма покупок за год
-        "UF_CRM_1759327062433" => $contactData['DEALS_COUNT_YEAR_FORMATTED'], // Число посещений за год (число сделок)
-        "UF_CRM_1763617746" => $contactData['LAST_PURCHASE_DATE_FORMATTED'],
-        "UF_CRM_1763645912" => $contactData['TOTAL_OPPORTUNITY_FORMATTED'],
-        "UF_CRM_1759327078738" => $contactData['DEALS_COUNT_FORMATTED'],
-        "UF_CRM_1759327027801" => $contactData['SUMM_LIST'],
+    // Получаем все контакты, чтобы найти тех, у кого нет сделок
+    $allContacts = CCrmContact::GetListEx(
+        [],
+        [],
+        false,
+        false,
+        ['ID']
     );
 
-    // Обновляем контакт
-    $updateResult = $oContact->Update($contactId, $arFields);
-}
+    $contactsWithoutDeals = [];
+    while ($contact = $allContacts->Fetch()) {
+        $contactId = $contact['ID'];
+        // Если контакта нет в массиве контактов со сделками, добавляем его в список контактов без сделок
+        if (!isset($contactsWithDeals[$contactId])) {
+            $contactsWithoutDeals[$contactId] = [
+                'CONTACT_ID' => $contactId,
+                'TOTAL_OPPORTUNITY' => 0,
+                'TOTAL_OPPORTUNITY_YEAR' => 0,
+                'DEALS_COUNT' => 0,
+                'DEALS_COUNT_YEAR' => 0,
+                'TOTAL_ITEMS' => 0,
+                'TOTAL_ITEMS_YEAR' => 0,
+                'LAST_PURCHASE_DATE' => null
+            ];
+        }
+    }
 
-echo "<pre>";
-print_r($result);
-echo "</pre>";
-	//changeAssigned($_REQUEST['seller'], $_REQUEST['deal_id']);
+    // Объединяем контакты со сделками и без сделок
+    $allContactsData = $result + $contactsWithoutDeals;
+
+    // Форматируем результат и добавляем поле в зависимости от суммы
+    foreach($allContactsData as &$contactData) {
+        // Определяем поле в зависимости от суммы
+        $totalOpportunity = $contactData['TOTAL_OPPORTUNITY'];
+        if ($totalOpportunity < 1000000) {
+            $contactData['SUMM_LIST'] = 55;
+        } elseif ($totalOpportunity >= 1000000 && $totalOpportunity < 5000000) {
+            $contactData['SUMM_LIST'] = 56;
+        } else {
+            $contactData['SUMM_LIST'] = 57;
+        }
+
+        // Форматируем суммы и количества
+        $contactData['TOTAL_OPPORTUNITY_YEAR_FORMATTED'] = $contactData['DEALS_COUNT_YEAR'] > 0 
+            ? number_format(floor($contactData['TOTAL_OPPORTUNITY_YEAR']), 0, '', ' ')
+            : '-';
+            
+        $contactData['DEALS_COUNT_YEAR_FORMATTED'] = $contactData['DEALS_COUNT_YEAR'] > 0 
+            ? $contactData['DEALS_COUNT_YEAR']
+            : '-';
+            
+        $contactData['TOTAL_OPPORTUNITY_FORMATTED'] = $contactData['DEALS_COUNT'] > 0 
+            ? number_format(floor($contactData['TOTAL_OPPORTUNITY']), 0, '', ' ')
+            : '-';
+            
+        $contactData['DEALS_COUNT_FORMATTED'] = $contactData['DEALS_COUNT'] > 0 
+            ? $contactData['DEALS_COUNT']
+            : '-';
+            
+        // Форматируем количество изделий
+        $contactData['TOTAL_ITEMS_FORMATTED'] = $contactData['TOTAL_ITEMS'] > 0 
+            ? number_format($contactData['TOTAL_ITEMS'], 0, '', ' ')
+            : '-';
+            
+        $contactData['TOTAL_ITEMS_YEAR_FORMATTED'] = $contactData['TOTAL_ITEMS_YEAR'] > 0 
+            ? number_format($contactData['TOTAL_ITEMS_YEAR'], 0, '', ' ')
+            : '-';
+        
+        // Форматируем дату последней покупки (убираем время)
+        if ($contactData['LAST_PURCHASE_DATE']) {
+            $lastPurchaseDate = new DateTime($contactData['LAST_PURCHASE_DATE']);
+            $contactData['LAST_PURCHASE_DATE_FORMATTED'] = $lastPurchaseDate->format('d.m.Y');
+        } else {
+            $contactData['LAST_PURCHASE_DATE_FORMATTED'] = '-';
+        }
+    }
+
+    $allContactsData = array_values($allContactsData);
+
+    // Обновляем все контакты
+    $oContact = new CCrmContact(false);
+    $updatedCount = 0;
+    $errorCount = 0;
+    
+    foreach($allContactsData as $contactData) {
+        $contactId = $contactData['CONTACT_ID'];
+
+        $arFields = array(
+            "UF_CRM_1763617810" => $contactData['TOTAL_OPPORTUNITY_YEAR_FORMATTED'], // Сумма покупок за год
+            "UF_CRM_1759327062433" => $contactData['DEALS_COUNT_YEAR_FORMATTED'], // Число сделок за год
+            "UF_CRM_1763617746" => $contactData['LAST_PURCHASE_DATE_FORMATTED'], // Дата последней покупки
+            "UF_CRM_1763645912" => $contactData['TOTAL_OPPORTUNITY_FORMATTED'], // Общая сумма покупок
+            "UF_CRM_1759327078738" => $contactData['DEALS_COUNT_FORMATTED'], // Общее число сделок
+            "UF_CRM_1759327027801" => $contactData['SUMM_LIST'], // Категория по сумме
+            "UF_CRM_1764876075" => $contactData['TOTAL_ITEMS_FORMATTED'], // Количество изделий всего
+            "UF_CRM_1764876090" => $contactData['TOTAL_ITEMS_YEAR_FORMATTED'], // Количество изделий за последний год
+        );
+
+        // Обновляем контакт
+        $updateResult = $oContact->Update($contactId, $arFields);
+        
+        if ($updateResult) {
+            $updatedCount++;
+        } else {
+            $errorCount++;
+            error_log("Ошибка обновления контакта ID: {$contactId}");
+        }
+    }
+
+    // Вывод статистики
+    echo "Статистика обновления:<br>";
+    echo "Всего контактов: " . count($allContactsData) . "<br>";
+    echo "Успешно обновлено: {$updatedCount}<br>";
+    echo "С ошибками: {$errorCount}<br>";
+    echo "Контактов со сделками: " . count($result) . "<br>";
+    echo "Контактов без сделок: " . count($contactsWithoutDeals) . "<br>";
 }
 
 /**
@@ -5228,6 +5330,170 @@ function processContactChangeApproval() {
     }
 }
 
+function activeCards() {
+    try {
+        echo "🔍 Поиск активных карт контактов...\n<br>";
+        
+        // Создаем логгер для отслеживания процесса
+        $logger = new JsonLogger();
+        
+        // Получаем всех контактов
+        $allContacts = CCrmContact::GetListEx(
+            [],
+            [],
+            false,
+            false,
+            ['ID', 'NAME', 'LAST_NAME', 'SECOND_NAME', 'UF_CRM_1764916739']
+        );
+        
+        $totalContacts = 0;
+        $updatedContacts = 0;
+        $errors = [];
+        
+        // Обрабатываем каждого контакта
+        while ($contact = $allContacts->Fetch()) {
+            $totalContacts++;
+            $contactId = $contact['ID'];
+            $currentCardId = $contact['UF_CRM_1764916739'] ?? null;
+            
+            echo "Обрабатываю контакт ID: {$contactId} ";
+            echo "({$contact['LAST_NAME']} {$contact['NAME']} {$contact['SECOND_NAME']})";
+            
+            // Ищем активные карты для этого контакта
+            $activeCards = findActiveCardsForContact($contactId);
+
+            // Если найдена только одна активная карта
+            if (count($activeCards) === 1) {
+                $activeCard = $activeCards[0];
+                $cardId = $activeCard['ID'];
+                
+                echo " - ✅ Найдена активная карта ID: {$cardId} ({$activeCard['NUMBER']})\n<br>";
+                
+                // Проверяем, нужно ли обновлять поле
+                if ($currentCardId != $cardId) {
+                    $updateResult = updateContactCardField($contactId, $cardId, $logger);
+                    
+                    if ($updateResult) {
+                        $updatedContacts++;
+                        echo "  ✅ Поле контакта обновлено\n<br>";
+                    } else {
+                        $errors[] = "Контакт {$contactId}: ошибка обновления поля карты";
+                        echo "  ❌ Ошибка обновления поля карты\n<br>";
+                    }
+                } else {
+                    echo "  ➡️ Поле уже содержит правильный ID карты\n<br>";
+                }
+            }
+        }
+        
+        // Выводим итоговую статистику
+        echo "\n\n=== ИТОГИ ОБРАБОТКИ АКТИВНЫХ КАРТ ===\n<br>";
+        echo "Всего обработано контактов: {$totalContacts}\n<br>";
+        echo "Обновлено контактов: {$updatedContacts}\n<br>";
+        echo "Ошибок: " . count($errors) . "\n<br>";
+        
+        if (!empty($errors)) {
+            echo "\nСписок ошибок:\n<br>";
+            foreach ($errors as $error) {
+                echo "  - {$error}\n<br>";
+            }
+        }
+
+        return [
+            'success' => true,
+            'total_contacts' => $totalContacts,
+            'updated_contacts' => $updatedContacts,
+            'errors' => $errors
+        ];
+        
+    } catch (Exception $e) {
+        error_log("Ошибка в функции activeCards: " . $e->getMessage());
+        echo "❌ Критическая ошибка: " . $e->getMessage() . "\n<br>";
+        
+        return [
+            'success' => false,
+            'error' => $e->getMessage()
+        ];
+    }
+}
+
+/**
+ * Ищет активные карты для контакта
+ */
+function findActiveCardsForContact($contactId) {
+    try {
+        $factory = Service\Container::getInstance()->getFactory(1038); // Смарт-процесс карт
+        
+        if (!$factory) {
+            error_log("Фабрика для смарт-процесса карт (1038) не найдена");
+            return [];
+        }
+        
+        // Ищем карты с условиями:
+        // 1. Привязаны к контакту (UF_CRM_3_CLIENT = $contactId)
+        // 2. Не заблокированы (UF_CRM_3_1759315419431 = 'N')
+        $items = $factory->getItems([
+            'filter' => [
+                '=CONTACT_ID' => $contactId,
+                '=UF_CRM_3_1759315419431' => 'N' // N - не заблокирована
+            ],
+            'select' => ['ID', 'UF_CRM_3_1759320971349'], // ID и номер карты
+            'order' => ['ID' => 'DESC'] // Берем самую новую карту
+        ]);
+        
+        $activeCards = [];
+        foreach ($items as $item) {
+            $activeCards[] = [
+                'ID' => $item->getId(),
+                'NUMBER' => $item->get('UF_CRM_3_1759320971349')
+            ];
+        }
+        
+        return $activeCards;
+        
+    } catch (Exception $e) {
+        error_log("Ошибка при поиске активных карт для контакта {$contactId}: " . $e->getMessage());
+        return [];
+    }
+}
+
+/**
+ * Обновляет поле карты контакта
+ */
+function updateContactCardField($contactId, $cardId, $logger) {
+    try {
+        $contact = new \CCrmContact(false);
+        
+        $updateFields = [
+            'UF_CRM_1764916739' => $cardId
+        ];
+        
+        $result = $contact->Update($contactId, $updateFields, true, true);
+        
+        if ($result) {
+            $logger->logSuccess('contact_card_update', $contactId, "Поле активной карты обновлено", [
+                'contact_id' => $contactId,
+                'card_id' => $cardId
+            ]);
+            return true;
+        } else {
+            $error = method_exists($contact, 'GetLAST_ERROR') ? $contact->GetLAST_ERROR() : 'Неизвестная ошибка';
+            $logger->logGeneralError('contact_card_update', $contactId, "Ошибка обновления поля карты: " . $error, [
+                'contact_id' => $contactId,
+                'card_id' => $cardId
+            ]);
+            return false;
+        }
+        
+    } catch (Exception $e) {
+        $logger->logGeneralError('contact_card_update', $contactId, "Исключение при обновлении поля карты: " . $e->getMessage(), [
+            'contact_id' => $contactId,
+            'card_id' => $cardId
+        ]);
+        return false;
+    }
+}
+
 if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
     processContactChangeApproval(); // Обработка подтверждений изменений
     processClientsSync(); // Синхронизация клиентов
@@ -5245,6 +5511,8 @@ if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
     }
 } elseif(strpos($_SERVER['REQUEST_URI'], 'action=count') !== false){
     countClientsSumm();
+} elseif(strpos($_SERVER['REQUEST_URI'], 'action=active') !== false){
+
 } else {
     $result = fetchAllData();
 
