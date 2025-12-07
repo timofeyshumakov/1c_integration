@@ -5,6 +5,8 @@ use \Bitrix\Main,
     \Bitrix\Crm\DealTable;
 require_once (__DIR__.'/lib/app/crest.php');
 
+define('SUPPORT', 3);
+
 class ContactChangesTracker {
     private $changesFile;
     private $logger;
@@ -486,7 +488,7 @@ class DealRelationManager {
             }
             
             // Получаем поле клиента из карты (предполагаемое поле UF_CRM_3_CLIENT)
-            $clientField = $card->get('UF_CRM_3_CLIENT');
+            $clientField = $card->get('CONTACT_ID');
             if (!empty($clientField)) {
                 return $clientField;
             }
@@ -1908,16 +1910,22 @@ class EntityManager {
 
         // Создаем сделку
         //$entityObject = new \CCrmDeal(false);
-        $assigned = CRest::call(
-            'user.get',
-            [
-                'UF_USR_1761980389716' => $entityFields["UF_CRM_1761200470"]
-            ]
-        )["result"][0]["ID"];
-        if(!empty($assigned)){
-            $entityFields["ASSIGNED_BY_ID"] = $assigned;
-        }
+        if($entityFields["UF_CRM_1761200470"] != null){
+            $assigned = CRest::call(
+                'user.get',
+                [
+                    'UF_USR_1761980389716' => $entityFields["UF_CRM_1761200470"],
+                ]
+            )["result"][0]["ID"];
 
+            if(!empty($assigned)){
+                $entityFields["ASSIGNED_BY_ID"] = $assigned;
+            }else{
+                $entityFields["ASSIGNED_BY_ID"] = SUPPORT;
+            }
+        }else{
+            $entityFields["ASSIGNED_BY_ID"] = SUPPORT;
+        }
 
         $entityId = CRest::call(
             'crm.deal.add',
@@ -1925,8 +1933,7 @@ class EntityManager {
                 'FIELDS' => $entityFields
             ]
         )["result"];
-                print_r('s1924');
-                print_r($entityId);
+
         $result = CRest::call(
             'bizproc.workflow.start',
             [
@@ -2840,6 +2847,7 @@ private function addProductToDeal($dealId, $product, $count, $price) {
             return false;
         }
     }
+
 }
 
 function main() {
@@ -3240,6 +3248,9 @@ function createDealWithMultipleProducts($purchasesGroup, $entityManager, $logger
         $entityFields = [
                     'TITLE' => $firstPurchase["title"],
                     'OPPORTUNITY' => $firstPurchase["sum"] ?? 0,
+                    'STAGE_ID' => $stageId,
+                    'CURRENCY_ID' => 'RUB',
+                    'IS_MANUAL_OPPORTUNITY' => 'Y',
                     'UF_CRM_1761785330' => $firstPurchase["sum"] ?? 0,
                     'UF_CRM_1756711109104' => $firstPurchase["receipt_number"] ?? '',
                     'UF_CRM_1756711204935' => $firstPurchase["register"] ?? '',
@@ -3254,9 +3265,7 @@ function createDealWithMultipleProducts($purchasesGroup, $entityManager, $logger
                     'UF_CRM_1759317764974' => $firstPurchase["item_name"] ?? '',
                     'UF_CRM_1759317788432' => abs($firstPurchase["count"]) ?? 0,
                     'UF_CRM_1759317801939' => abs($firstPurchase["weight"]) ?? 0,
-                    'STAGE_ID' => $stageId,
-                    'CURRENCY_ID' => 'RUB',
-                    'IS_MANUAL_OPPORTUNITY' => 'Y',
+                    'UF_CRM_1764868525' => count($purchasesGroup),
         ];
 
         // Создаем сделку
@@ -3744,7 +3753,156 @@ private function findCardByClientId($clientId) {
             return false;
         }
     }
+    /**
+     * Подсчитывает количество изделий для контакта (всего и за последний год)
+     * @param int $contactId ID контакта
+     * @return array Массив с подсчетами
+     */
+    private function calculateContactItems($contactId) {
+        $oneYearAgo = (new DateTime())->modify('-1 year');
 
+        $arFilter = [
+            '=CONTACT_ID' => $contactId
+        ];
+        
+        $arSelect = [
+            "ID",
+            "UF_CRM_1760529583", // Дата сделки
+            "UF_CRM_1764868525", // Количество изделий в сделке
+        ];
+        
+        $arDeals = DealTable::getList([
+            'filter' => $arFilter,
+            'select' => $arSelect,
+        ])->fetchAll();
+
+        $totalItems = 0;
+        $totalItemsYear = 0;
+
+        foreach ($arDeals as $deal) {
+            $itemCount = (float)$deal['UF_CRM_1764868525'] ?: 0;
+            
+            // Общее количество изделий
+            $totalItems += $itemCount;
+            
+            // Дата сделки
+            $dealDateStr = $deal['UF_CRM_1760529583'] ?? '';
+            if ($dealDateStr) {
+                $dealDate = new DateTime($dealDateStr);
+                if ($dealDate >= $oneYearAgo) {
+                    $totalItemsYear += $itemCount;
+                }
+            }
+        }
+
+        return [
+            'TOTAL_ITEMS' => $totalItems,
+            'TOTAL_ITEMS_YEAR' => $totalItemsYear,
+        ];
+    }
+
+    /**
+     * Обновляет поля контакта с количеством изделий
+     * @param int $contactId ID контакта
+     * @param array $itemsData Массив с TOTAL_ITEMS и TOTAL_ITEMS_YEAR
+     * @return bool Успех обновления
+     */
+    private function updateContactItemsFields($contactId, $itemsData) {
+        try {
+            $contact = new \CCrmContact(false);
+            
+            $updateFields = [
+                'UF_CRM_1764876075' => number_format($itemsData['TOTAL_ITEMS'], 0, '', ' '), // Количество изделий всего (форматированное)
+                'UF_CRM_1764876090' => number_format($itemsData['TOTAL_ITEMS_YEAR'], 0, '', ' '), // Количество изделий за год (форматированное)
+            ];
+            
+            $result = $contact->Update($contactId, $updateFields, true, true);
+            
+            if ($result) {
+                $this->logger->logSuccess('contact_items_update', $contactId, "Поля количества изделий обновлены", $itemsData);
+                return true;
+            } else {
+                $error = method_exists($contact, 'GetLAST_ERROR') ? $contact->GetLAST_ERROR() : 'Неизвестная ошибка';
+                $this->logger->logGeneralError('contact_items_update', $contactId, "Ошибка обновления полей изделий: " . $error, $itemsData);
+                return false;
+            }
+            
+        } catch (Exception $e) {
+            $this->logger->logGeneralError('contact_items_update', $contactId, "Исключение при обновлении полей изделий: " . $e->getMessage(), $itemsData);
+            return false;
+        }
+    }
+
+    /**
+     * Получает активную карту для контакта (привязанную и не заблокированную, предполагается одна)
+     * @param int $contactId ID контакта
+     * @return array|null Данные карты или null, если не найдена
+     */
+    private function getActiveCardForContact($contactId) {
+        try {
+            $factory = Service\Container::getInstance()->getFactory(1038); // Смарт-процесс карт (ID 1038)
+            
+            if (!$factory) {
+                $this->logger->logGeneralError('active_card', $contactId, "Фабрика для смарт-процесса карт (1038) не найдена");
+                return null;
+            }
+            
+            $items = $factory->getItems([
+                'filter' => [
+                    '=UF_CRM_3_CLIENT' => $contactId,
+                    '=UF_CRM_3_1759315419431' => 'N' // N - не заблокирована
+                ],
+                'select' => ['ID', 'UF_CRM_3_1759320971349'], // ID и номер карты
+                'order' => ['ID' => 'DESC'], // Самая новая
+                'limit' => 1 // Только одна
+            ]);
+            
+            if (!empty($items)) {
+                $item = $items[0];
+                return [
+                    'ID' => $item->getId(),
+                    'NUMBER' => $item->get('UF_CRM_3_1759320971349')
+                ];
+            }
+            
+            return null;
+            
+        } catch (Exception $e) {
+            $this->logger->logGeneralError('active_card', $contactId, "Ошибка при поиске активной карты: " . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Обновляет поле активной карты в контакте
+     * @param int $contactId ID контакта
+     * @param int $cardId ID активной карты
+     * @return bool Успех обновления
+     */
+    private function updateContactActiveCard($contactId, $cardId) {
+        try {
+            $contact = new \CCrmContact(false);
+            
+            $updateFields = [
+                'UF_CRM_1764916739' => $cardId // Поле для активной карты
+            ];
+            
+            $result = $contact->Update($contactId, $updateFields, true, true);
+            
+            if ($result) {
+                $this->logger->logSuccess('contact_active_card_update', $contactId, "Поле активной карты обновлено", ['card_id' => $cardId]);
+                return true;
+            } else {
+                $error = method_exists($contact, 'GetLAST_ERROR') ? $contact->GetLAST_ERROR() : 'Неизвестная ошибка';
+                $this->logger->logGeneralError('contact_active_card_update', $contactId, "Ошибка обновления поля активной карты: " . $error, ['card_id' => $cardId]);
+                return false;
+            }
+            
+        } catch (Exception $e) {
+            $this->logger->logGeneralError('contact_active_card_update', $contactId, "Исключение при обновлении поля активной карты: " . $e->getMessage(), ['card_id' => $cardId]);
+            return false;
+        }
+    }
     /**
      * Синхронизирует клиентов из API с Bitrix24
      */
@@ -4359,7 +4517,7 @@ if(CModule::IncludeModule("im")){
             echo "    ➡️ Найдена существующая карта: {$cardNumber}\n";
             
             // Проверяем, привязана ли карта к правильному клиенту
-            $currentClientId = $existingCard['data']['UF_CRM_3_CLIENT'] ?? null;
+            $currentClientId = $existingCard['data']['CONTACT_ID'] ?? null;
             if ($currentClientId != $clientId) {
                 echo "    🔄 Обновляем привязку карты к клиенту: {$cardNumber}\n";
                 $this->updateCardClient($existingCard['id'], $clientId);
@@ -4600,7 +4758,13 @@ if(CModule::IncludeModule("im")){
             
             // Создаем сделки для ВСЕХ карт клиента
             $this->findAndCreateDealsForAllClientCards($clientId, $clientCode);
-            
+            $itemsData = $this->calculateContactItems($clientId);
+            $this->updateContactItemsFields($clientId, $itemsData);
+            // Получаем и устанавливаем активную карту
+            $activeCard = $this->getActiveCardForContact($clientId);
+            if ($activeCard) {
+                $this->updateContactActiveCard($clientId, $activeCard['ID']);
+            }
             return [
                 'status' => 'created',
                 'bitrix_id' => $clientId,
@@ -4624,7 +4788,7 @@ if(CModule::IncludeModule("im")){
             // 2. Не заблокированы (UF_CRM_3_1759315419431 = 'N')
             $items = $factory->getItems([
                 'filter' => [
-                    '=UF_CRM_3_CLIENT' => $contactId,
+                    '=CONTACT_ID' => $contactId,
                     '=UF_CRM_3_1759315419431' => 'N' // N - не заблокирована
                 ],
                 'select' => ['ID', 'UF_CRM_3_1759320971349'],
@@ -4644,6 +4808,7 @@ if(CModule::IncludeModule("im")){
             return [];
         }
     }
+
     private function updateActiveCardForExistingClient($contactId, $clientCode) {
         try {
             // 1. Проверяем текущую активную карту в Bitrix
@@ -4661,7 +4826,7 @@ if(CModule::IncludeModule("im")){
                 $card = $this->findCardByNumber($cardNumberToSet);
                 
                 if ($card && $currentCardField != $card['id']) {
-                    $this->updateContactWithActiveCard($contactId, $cardNumberToSet);
+                    //$this->updateContactWithActiveCard($contactId, $cardNumberToSet);
                 }
             } elseif ($currentCardField) {
                 // Если нет активных карт, но поле заполнено - очищаем его
@@ -4675,6 +4840,7 @@ if(CModule::IncludeModule("im")){
             echo "  ⚠️  Ошибка обновления активной карты: " . $e->getMessage() . "\n";
         }
     }
+
     /**
      * Синхронизирует одного клиента со всеми его картами
      */
@@ -4691,7 +4857,7 @@ if(CModule::IncludeModule("im")){
                 $newClient = $this->createNewClient($clientData);
                 if(!empty($newClient)){
                     $this->findAndCreateDealsForAllClientCards($newClient['bitrix_id'], $clientCode);
-                    $this->updateActiveCardForExistingClient($newClient['bitrix_id'], $clientCode);
+                    //$this->updateActiveCardForExistingClient($newClient['bitrix_id'], $clientCode);
                 }
                 return $newClient;
             }
@@ -5504,8 +5670,6 @@ if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
         $timestamp = $_REQUEST['date'];
         $fromDate = new DateTime();
         $fromDate->setTimestamp($timestamp);
-        print_r('fromDate');
-        print_r($fromDate);
         processRecentPurchases($fromDate);
     } else {
     }
