@@ -59,15 +59,47 @@ class ContactChangesTracker {
         $changes = $this->loadChanges();
         
         foreach ($changes as $change) {
+            // Проверяем только изменения в том же статусе, которые еще не были обработаны
             if ($change['contact_id'] == $contactId && 
                 $change['field'] == $field && 
                 $change['new_value'] == $newValue &&
-                $change['status'] == 'pending') {
+                ($change['status'] == 'pending' || $change['status'] == 'approved')) {
+                // Нашли дубликат - такое же изменение уже есть и еще не применено
                 return true;
             }
         }
         
         return false;
+    }
+
+    public function cleanupAppliedChanges($contactId, $field = null, $keepLast = 10) {
+        $changes = $this->loadChanges();
+        $filteredChanges = [];
+        $appliedCount = 0;
+        
+        // Сортируем изменения от новых к старым
+        usort($changes, function($a, $b) {
+            return strtotime($b['created_at']) - strtotime($a['created_at']);
+        });
+        
+        foreach ($changes as $change) {
+            if ($change['contact_id'] == $contactId && 
+                ($field === null || $change['field'] == $field)) {
+                
+                if ($change['status'] == 'applied') {
+                    $appliedCount++;
+                    if ($appliedCount > $keepLast) {
+                        // Пропускаем старые примененные изменения
+                        continue;
+                    }
+                }
+            }
+            
+            $filteredChanges[] = $change;
+        }
+        
+        $this->saveChanges($filteredChanges);
+        return true;
     }
     
     /**
@@ -183,7 +215,7 @@ class ContactChangesTracker {
             ]
         ];
         
-        return $this->sendBitrixNotification($message, $buttons, 3, $contactId); // Отправляем администратору (ID=1)
+        return $this->sendBitrixNotification($message, $buttons, 3, $contactId);
     }
     
     /**
@@ -303,6 +335,9 @@ class ContactChangesTracker {
                 }
             }
         }
+        
+        // Очищаем старые примененные изменения (оставляем только последние 10)
+        //$this->cleanupAppliedChanges($contactId, null, 10);
         
         return $appliedChanges;
     }
@@ -1921,10 +1956,10 @@ class EntityManager {
             if(!empty($assigned)){
                 $entityFields["ASSIGNED_BY_ID"] = $assigned;
             }else{
-                $entityFields["ASSIGNED_BY_ID"] = SUPPORT;
+                $entityFields["ASSIGNED_BY_ID"] = 3;
             }
         }else{
-            $entityFields["ASSIGNED_BY_ID"] = SUPPORT;
+            $entityFields["ASSIGNED_BY_ID"] = 3;
         }
 
         $entityId = CRest::call(
@@ -1945,6 +1980,7 @@ class EntityManager {
                 ],
             ]
         );
+
                 print_r($result);
         if (!$entityId) {
             return false;
@@ -2603,13 +2639,13 @@ private function addProductToDeal($dealId, $product, $count, $price) {
                 }
                 $item["title"] = '';
                 if ($item["sum"] > 0) {
-                    $item["title"] = 'Продажа №' . $item["receipt_number"] . ' от ' . $dateManager->formatDate($item["date"]);
+                    $item["title"] = 'Продажа №' . $item["receipt_number"] . ' от ' . $item['receipt_date'] === '0001-01-01T00:00:00' ? $dateManager->formatDate($item["date"] ?? '') : $dateManager->formatDate($item["receipt_date"] ?? '');
                 } elseif ($item["sum"] < 0) {
                     $item["title"] = '';
                 }
 
                 $todayMinusThreeDays = new DateTime(date('Y-m-d', strtotime('-3 days')));
-                $purchaseDate = new DateTime($item["date"]);
+                $purchaseDate = new DateTime($item['receipt_date'] === '0001-01-01T00:00:00' ? $item["date"] : $item['receipt_date']);
 
                 $stageId = "NEW";
                 if ($purchaseDate < $todayMinusThreeDays) {
@@ -2623,7 +2659,7 @@ private function addProductToDeal($dealId, $product, $count, $price) {
                     'UF_CRM_1761785330' => $item["sum"] ?? 0,
                     'UF_CRM_1756711109104' => $item["receipt_number"] ?? '',
                     'UF_CRM_1756711204935' => $item["register"] ?? '',
-                    'UF_CRM_1760529583' => $dateManager->formatDate($item["date"] ?? ''),
+                    'UF_CRM_1760529583' => $item['receipt_date'] === '0001-01-01T00:00:00' ? $dateManager->formatDate($item["date"] ?? '') : $dateManager->formatDate($item["receipt_date"] ?? ''),
                     'UF_CRM_1756713651' => $item["warehouse_code"] ?? '',
                     'UF_CRM_1761200403' => $item["warehouse_code"] ?? '',
                     //'UF_CRM_1759317671' => $item["cashier_code"] ?? '',
@@ -3129,8 +3165,7 @@ function groupPurchasesByReceipt($purchases) {
     
     foreach ($purchases as $purchase) {
         $receiptNumber = $purchase['receipt_number'] ?? '';
-        $date = $purchase['date'] ?? '';
-        
+        $date = $purchase['receipt_date'] === '0001-01-01T00:00:00' ? $purchase["date"] : $purchase["receipt_date"];
         if (empty($receiptNumber) || empty($date)) {
             continue;
         }
@@ -3230,12 +3265,12 @@ function createDealWithMultipleProducts($purchasesGroup, $entityManager, $logger
     $entityId = $firstPurchase["receipt_number"] ?? 'unknown';
                 $firstPurchase["title"] = '';
                 if ((int)$firstPurchase["sum"] > 0) {
-                    $firstPurchase["title"] = 'Продажа №' . $firstPurchase["receipt_number"] . ' от ' . $dateManager->formatDate($firstPurchase["date"]);
+                    $firstPurchase["title"] = 'Продажа №' . $firstPurchase["receipt_number"] . ' от ' . $firstPurchase['receipt_date'] === '0001-01-01T00:00:00' ? $dateManager->formatDate($firstPurchase["date"] ?? '') : $dateManager->formatDate($firstPurchase["receipt_date"] ?? '');
                 } elseif ((int)$firstPurchase["sum"] < 0) {
-                    $firstPurchase["title"] = 'Возврат №' . $firstPurchase["receipt_number"] . ' от ' . $dateManager->formatDate($firstPurchase["date"]);
+                    $firstPurchase["title"] = 'Возврат №' . $firstPurchase["receipt_number"] . ' от ' . $firstPurchase['receipt_date'] === '0001-01-01T00:00:00' ? $dateManager->formatDate($firstPurchase["date"] ?? '') : $dateManager->formatDate($firstPurchase["receipt_date"] ?? '');
                 }
                 $todayMinusThreeDays = new DateTime(date('Y-m-d', strtotime('-3 days')));
-                $purchaseDate = new DateTime($firstPurchase["date"]);
+                $purchaseDate = new DateTime($firstPurchase['receipt_date'] === '0001-01-01T00:00:00' ? $firstPurchase["date"] : $firstPurchase['receipt_date']);
 
                 $stageId = "NEW";
                 if ($purchaseDate < $todayMinusThreeDays) {
@@ -3254,7 +3289,7 @@ function createDealWithMultipleProducts($purchasesGroup, $entityManager, $logger
                     'UF_CRM_1761785330' => $firstPurchase["sum"] ?? 0,
                     'UF_CRM_1756711109104' => $firstPurchase["receipt_number"] ?? '',
                     'UF_CRM_1756711204935' => $firstPurchase["register"] ?? '',
-                    'UF_CRM_1760529583' => $dateManager->formatDate($firstPurchase["date"] ?? ''),
+                    'UF_CRM_1760529583' => $firstPurchase['receipt_date'] === '0001-01-01T00:00:00' ? $dateManager->formatDate($firstPurchase["date"] ?? '') : $dateManager->formatDate($firstPurchase["receipt_date"] ?? ''),
                     'UF_CRM_1756713651' => $firstPurchase["warehouse_code"] ?? '',
                     'UF_CRM_1761200403' => $firstPurchase["warehouse_code"] ?? '',
                     //'UF_CRM_1759317671' => $firstPurchase["cashier_code"] ?? '',
@@ -3350,12 +3385,11 @@ function filterRecentPurchases($purchases, $fromDate) {
     print_r($purchases);
     print_r($fromDate);
     foreach ($purchases as $purchase) {
-        if (empty($purchase['date'])) {
+        if (empty($purchase['receipt_date'])) {
             continue;
         }
-
         // Парсим дату из формата "2025-05-19T20:03:56"
-        $purchaseDate = DateTime::createFromFormat('Y-m-d\TH:i:s', $purchase['date']);
+        $purchaseDate = DateTime::createFromFormat('Y-m-d\TH:i:s', $purchase['receipt_date'] === '0001-01-01T00:00:00' ? $purchase['date'] : $purchase['receipt_date']);
         
         if ($purchaseDate === false) {
             continue;
@@ -3471,6 +3505,7 @@ class ClientSyncManager {
 
             // Фильтруем покупки по номеру карты (который соответствует коду клиента)
             $clientPurchases = $this->filterPurchasesByCardNumber($allPurchases, $cardNumber);
+            //$this->logger->logGeneralError('client_deals', $clientPurchases);
             print_r($clientPurchases);
             if (empty($clientPurchases)) {
                 echo "ℹ️ Не найдено покупок для карты: {$cardNumber}\n";
@@ -3651,7 +3686,7 @@ private function findCardByClientId($clientId) {
 
         $firstPurchase = $purchasesGroup[0];
         $entityId = $firstPurchase["receipt_number"] ?? 'unknown';
-        $sellDate = $dateManager->formatDate($firstPurchase["date"] ?? '');
+        $sellDate = $firstPurchase['receipt_date'] === '0001-01-01T00:00:00' ? $dateManager->formatDate($firstPurchase["date"] ?? '') : $dateManager->formatDate($firstPurchase["receipt_date"] ?? '');
 
         try {
             // Проверяем, не существует ли уже сделка с таким номером чека
@@ -3923,7 +3958,7 @@ private function findCardByClientId($clientId) {
         }
         
         echo "Получено клиентов из API: " . count($apiClients) . "\n";
-            $bxClientsCount = CRest::call(
+        $bxClientsCount = CRest::call(
                 'crm.contact.list',
                 [
                     'FILTER' => [],
@@ -3934,18 +3969,27 @@ private function findCardByClientId($clientId) {
                         'ID',
                     ]
                 ]
-            )["total"];
-            $create = count($apiClients) > $bxClientsCount;
+        )["total"];
+        $create = count($apiClients) > $bxClientsCount;
+
+        // Начальное время запуска скрипта
+        $startTime = microtime(true);
+        $maxExecutionTime = 50 * 60; // 50 минут в секундах
 
         foreach ($apiClients as $clientData) {
-            $clientCode = $clientData['code'] ?? 'unknown';
-            if($clientCode == "00000101709"){
-               // $clientData['middle_name'] = 'test';
-
-            }else{
-
+            // Проверка времени выполнения
+            $currentTime = microtime(true);
+            $executionTime = $currentTime - $startTime;
+            
+            if ($executionTime >= $maxExecutionTime) {
+                $executionMinutes = round($executionTime / 60, 1);
+                echo "Превышено максимальное время выполнения ({$executionMinutes} минут). Синхронизация остановлена.\n";
+                break; // Выход из цикла
             }
 
+            $clientCode = $clientData['code'] ?? 'unknown';
+            if(true){
+               // $clientData['middle_name'] = 'test';
             try {
                 // Синхронизируем клиента
                 $syncResult = $this->syncSingleClient($clientData, $create);
@@ -3975,6 +4019,11 @@ private function findCardByClientId($clientId) {
                 $this->logger->logGeneralError('client_sync', $clientCode, "Ошибка синхронизации клиента: " . $e->getMessage(), $clientData);
                 echo "❌ Ошибка клиента {$clientCode}: " . $e->getMessage() . "\n";
             }
+            }else{
+
+            }
+
+
         }
 
         countClientsSumm();
@@ -4865,7 +4914,6 @@ if(CModule::IncludeModule("im")){
         } else {
             $syncResult = $this->updateClientIfChanged($existingClient, $clientData);
             return $syncResult;
-            /*
             // Обновляем клиента и синхронизируем все карты
             
             
@@ -4873,9 +4921,6 @@ if(CModule::IncludeModule("im")){
             if ($syncResult['status'] !== 'error') {
                 $this->findAndCreateDealsForAllClientCards($existingClient['id'], $clientCode);
             }
-            
-            
-            */
         }
     }
 
@@ -5072,7 +5117,7 @@ function createInitialBalanceDeals($purchases) {
         $receiptNumber = $purchase['receipt_number'] ?? '';
         $cardNumber = $purchase['card_number'] ?? '';
         $sum = $purchase['sum'] ?? 0;
-        $purchaseDateString = $dateManager->formatDate($purchase['date']) ?? '';
+        $purchaseDateString = $purchase['receipt_date'] === '0001-01-01T00:00:00' ? $dateManager->formatDate($purchase["date"] ?? '') : $dateManager->formatDate($purchase["receipt_date"] ?? '');
 
         if (empty($itemName) && !empty($receiptNumber) && !empty($cardNumber) && $sum != 0) {
             try {
@@ -5085,7 +5130,7 @@ function createInitialBalanceDeals($purchases) {
                         'deal_id' => $existingDeal['ID'],
                         'card_number' => $cardNumber,
                         'sum' => $sum,
-                        'date' => $purchaseDateString
+                        'receipt_date' => $purchaseDateString
                     ];
                     echo "  ➡️ Сделка начального остатка уже существует: {$existingDeal['ID']}\n";
                     continue;
@@ -5163,7 +5208,7 @@ function createInitialBalanceDeal($purchase, $entityManager, $dateManager, $cont
     $receiptNumber = $purchase['receipt_number'] ?? 'unknown';
     $cardNumber = $purchase['card_number'] ?? '';
     $sum = $purchase['sum'] ?? 0;
-    $purchaseDateSting = $dateManager->formatDate($purchase['date']) ?? '';
+    $purchaseDateSting = $purchase['receipt_date'] === '0001-01-01T00:00:00' ? $dateManager->formatDate($purchase["date"] ?? '') : $dateManager->formatDate($purchase["receipt_date"] ?? '');
 
     $existingDeal = findExistingInitialBalanceDeal($cardNumber, $purchaseDateSting);
     if ($existingDeal) {
@@ -5174,7 +5219,7 @@ function createInitialBalanceDeal($purchase, $entityManager, $dateManager, $cont
     // Создаем название для сделки
     $dealTitle = "Внесение начального остатка по карте {$cardNumber}";
                 $todayMinusThreeDays = new DateTime(date('Y-m-d', strtotime('-3 days')));
-                $purchaseDate = new DateTime($purchase["date"]);
+                $purchaseDate = new DateTime($purchase["receipt_date"] === '0001-01-01T00:00:00' ? $purchase["date"] : $purchase["receipt_date"]);
 
                 $stageId = "NEW";
                 if ($purchaseDate < $todayMinusThreeDays) {
@@ -5293,7 +5338,7 @@ function countClientsSumm(){
         // Добавляем контакт в список контактов со сделками
         $contactsWithDeals[$contactId] = true;
         
-        $date = $deal["UF_CRM_1760529583"]->toString();
+        $date = $deal["UF_CRM_1760529583"];
         $dealDate = new DateTime($date);
         
         // Получаем количество изделий из сделки (поле UF_CRM_1764868525)
@@ -5423,11 +5468,12 @@ function countClientsSumm(){
             "UF_CRM_1763617810" => $contactData['TOTAL_OPPORTUNITY_YEAR_FORMATTED'], // Сумма покупок за год
             "UF_CRM_1759327062433" => $contactData['DEALS_COUNT_YEAR_FORMATTED'], // Число сделок за год
             "UF_CRM_1763617746" => $contactData['LAST_PURCHASE_DATE_FORMATTED'], // Дата последней покупки
-            "UF_CRM_1763645912" => $contactData['TOTAL_OPPORTUNITY_FORMATTED'], // Общая сумма покупок
+            "UF_CRM_1763645912" => $contactData['TOTAL_OPPORTUNITY_FORMATTED'], // Сумма покупок форматированная
             "UF_CRM_1759327078738" => $contactData['DEALS_COUNT_FORMATTED'], // Общее число сделок
             "UF_CRM_1759327027801" => $contactData['SUMM_LIST'], // Категория по сумме
             "UF_CRM_1764876075" => $contactData['TOTAL_ITEMS_FORMATTED'], // Количество изделий всего
             "UF_CRM_1764876090" => $contactData['TOTAL_ITEMS_YEAR_FORMATTED'], // Количество изделий за последний год
+            "UF_CRM_1759327040623" => round($contactData['TOTAL_OPPORTUNITY']), // Сумма покупок всего
         );
 
         // Обновляем контакт
@@ -5660,6 +5706,430 @@ function updateContactCardField($contactId, $cardId, $logger) {
     }
 }
 
+
+
+
+/**
+ * Action для обновления названий сделок на основе данных API
+ * Ищет сделки в Bitrix, сверяет их с данными API и обновляет названия
+ */
+function processDealTitleUpdate() {
+    $logger = new JsonLogger();
+    $dateManager = new DateManager();
+    
+    echo "🔄 Начинаем обновление названий сделок...\n<br>";
+    
+    try {
+        // 1. Получаем все сделки из Bitrix с нужными полями
+        $deals = getAllBitrixDeals();
+        echo "📊 Получено сделок из Bitrix: " . count($deals) . "\n<br>";
+        print_r($deals);
+        // 2. Получаем все покупки из API
+        $apiPurchases = getAllPurchasesFromApi();
+        echo "📊 Получено покупок из API: " . count($apiPurchases) . "\n<br>";
+        
+        // 3. Группируем покупки из API по номеру чека и дате для быстрого поиска
+        $apiPurchasesByReceipt = groupApiPurchasesByReceipt($apiPurchases);
+        echo "📊 Сгруппировано чеков в API: " . count($apiPurchasesByReceipt) . "\n<br>";
+  
+        $results = [
+            'updated' => [],
+            'skipped' => [],
+            'errors' => [],
+            'not_found_in_api' => []
+        ];
+
+        // 4. Обрабатываем каждую сделку из Bitrix
+        foreach ($deals as $deal) {
+            $dealId = $deal['ID'];
+            $receiptNumber = $deal['UF_CRM_1756711109104'] ?? '';
+            $sellDate = $deal['UF_CRM_1760529583'] ?? '';
+            $currentTitle = $deal['TITLE'] ?? '';
+            $cardNumber = $deal['UF_CRM_1761200496'] ?? '';
+
+            if (empty($receiptNumber) || empty($sellDate)) {
+                $results['skipped'][] = [
+                    'deal_id' => $dealId,
+                    'reason' => 'Отсутствует номер чека или дата продажи'
+                ];
+                continue;
+            }
+            
+            // Формируем ключ для поиска в API данных
+            $receiptKey = createReceiptKey($receiptNumber, $sellDate);
+            
+            // Ищем покупку в API данных
+            if (isset($apiPurchasesByReceipt[$receiptKey])) {
+                $apiPurchase = $apiPurchasesByReceipt[$receiptKey];
+                
+                // Определяем тип сделки (с товарами или без)
+                $newTitle = determineDealTitle($apiPurchase, $cardNumber, $dateManager);
+                
+                // Сравниваем текущее название с новым
+                if ($currentTitle !== $newTitle) {
+                    $updateResult = updateDealTitle($dealId, $newTitle, $logger);
+                    
+                    if ($updateResult) {
+                        $results['updated'][] = [
+                            'deal_id' => $dealId,
+                            'old_title' => $currentTitle,
+                            'new_title' => $newTitle,
+                            'receipt_number' => $receiptNumber,
+                            'card_number' => $cardNumber
+                        ];
+                        echo "✅ Обновлена сделка ID: {$dealId}, чек: {$receiptNumber}\n<br>";
+                        echo "   Старое название: {$currentTitle}\n<br>";
+                        echo "   Новое название: {$newTitle}\n<br>";
+                    } else {
+                        $results['errors'][] = [
+                            'deal_id' => $dealId,
+                            'receipt_number' => $receiptNumber,
+                            'error' => 'Ошибка обновления в БД'
+                        ];
+                        echo "❌ Ошибка обновления сделки ID: {$dealId}\n<br>";
+                    }
+                } else {
+                    $results['skipped'][] = [
+                        'deal_id' => $dealId,
+                        'reason' => 'Название уже актуальное',
+                        'title' => $currentTitle
+                    ];
+                }
+            } else {
+                $results['not_found_in_api'][] = [
+                    'deal_id' => $dealId,
+                    'receipt_number' => $receiptNumber,
+                    'sell_date' => $sellDate
+                ];
+                echo "ℹ️ Не найдено в API: сделка {$dealId}, чек {$receiptNumber}\n<br>";
+            }
+        }
+        
+        // 5. Выводим результаты
+        echo "\n\n=== РЕЗУЛЬТАТЫ ОБНОВЛЕНИЯ НАЗВАНИЙ СДЕЛОК ===\n<br>";
+        echo "Всего обработано сделок: " . count($deals) . "\n<br>";
+        echo "Обновлено: " . count($results['updated']) . "\n<br>";
+        echo "Пропущено: " . count($results['skipped']) . "\n<br>";
+        echo "Ошибок: " . count($results['errors']) . "\n<br>";
+        echo "Не найдено в API: " . count($results['not_found_in_api']) . "\n<br>";
+        
+        // Детальная статистика
+        if (!empty($results['updated'])) {
+            echo "\n--- Обновленные сделки ---\n<br>";
+            foreach ($results['updated'] as $updated) {
+                echo "Сделка ID: {$updated['deal_id']}, Чек: {$updated['receipt_number']}\n<br>";
+                echo "   Было: {$updated['old_title']}\n<br>";
+                echo "   Стало: {$updated['new_title']}\n<br>";
+            }
+        }
+        
+        // Логируем результаты
+        $logger->logGeneralError('deal_title_update', 'batch', "Обновление названий сделок завершено", [
+            'total_deals' => count($deals),
+            'updated' => count($results['updated']),
+            'skipped' => count($results['skipped']),
+            'errors' => count($results['errors']),
+            'not_found_in_api' => count($results['not_found_in_api']),
+            'details' => $results
+        ]);
+        
+        return $results;
+        
+    } catch (Exception $e) {
+        echo "❌ Критическая ошибка: " . $e->getMessage() . "\n<br>";
+        $logger->logGeneralError('deal_title_update', 'batch', "Критическая ошибка: " . $e->getMessage());
+        return [
+            'success' => false,
+            'error' => $e->getMessage()
+        ];
+    }
+}
+
+/**
+ * Получает все сделки из Bitrix с необходимыми полями
+ */
+function getAllBitrixDeals() {
+    try {
+        echo 'lol';
+        $deals = DealTable::getList([
+            'select' => [
+                'ID',
+                'TITLE',
+            ]
+        ])->fetchAll();
+        print_r($deals);
+        return $deals;
+        
+    } catch (Exception $e) {
+        error_log("Ошибка при получении сделок из Bitrix: " . $e->getMessage());
+        return [];
+    }
+}
+
+/**
+ * Получает все покупки из API
+ */
+function getAllPurchasesFromApi() {
+    $apiConfig = getApiCredentials();
+    $client = new ApiClient(
+        $apiConfig['username'] ?? '', 
+        $apiConfig['password'] ?? '', 
+        $apiConfig['base_url'] ?? ''
+    );
+    
+    $result = $client->makeRequest('purchases', 'GET');
+    
+    if ($result['success']) {
+        return json_decode($result['response'], JSON_UNESCAPED_UNICODE) ?: [];
+    }
+    
+    return [];
+}
+
+/**
+ * Группирует покупки из API по номеру чека и дате
+ */
+function groupApiPurchasesByReceipt($apiPurchases) {
+    $grouped = [];
+    $dateManager = new DateManager();
+    
+    foreach ($apiPurchases as $purchase) {
+        $receiptNumber = $purchase['receipt_number'] ?? '';
+        $date = $purchase['receipt_date'] === '0001-01-01T00:00:00' 
+            ? $dateManager->formatDate($purchase["date"] ?? '') 
+            : $dateManager->formatDate($purchase["receipt_date"] ?? '');
+        
+        if (!empty($receiptNumber) && !empty($date)) {
+            $key = createReceiptKey($receiptNumber, $date);
+            
+            // Если для этого чека уже есть запись, объединяем информацию о товарах
+            if (isset($grouped[$key])) {
+                $grouped[$key]['has_items'] = $grouped[$key]['has_items'] || !empty($purchase['item_name']);
+                $grouped[$key]['purchases'][] = $purchase;
+            } else {
+                $grouped[$key] = [
+                    'receipt_number' => $receiptNumber,
+                    'date' => $date,
+                    'card_number' => $purchase['card_number'] ?? '',
+                    'has_items' => !empty($purchase['item_name']),
+                    'purchases' => [$purchase]
+                ];
+            }
+        }
+    }
+    
+    return $grouped;
+}
+
+/**
+ * Создает ключ для группировки по номеру чека и дате
+ */
+function createReceiptKey($receiptNumber, $date) {
+    // Нормализуем дату к одному формату
+    $dateObj = DateTime::createFromFormat('d.m.Y H:i:s', $date);
+    if ($dateObj) {
+        $normalizedDate = $dateObj->format('Y-m-d');
+    } else {
+        $normalizedDate = $date;
+    }
+    
+    return $receiptNumber . '_' . $normalizedDate;
+}
+
+/**
+ * Определяет название для сделки на основе данных API
+ */
+function determineDealTitle($apiPurchaseData, $cardNumber, $dateManager) {
+    $receiptNumber = $apiPurchaseData['receipt_number'] ?? '';
+    $date = $apiPurchaseData['date'] ?? '';
+    $hasItems = $apiPurchaseData['has_items'] ?? false;
+    
+    // Если не указан номер карты, берем из данных API
+    if (empty($cardNumber)) {
+        $cardNumber = $apiPurchaseData['card_number'] ?? '';
+    }
+    
+    if ($hasItems) {
+        // С товарами - название для продажи
+        return 'Продажа №' . $receiptNumber . ' от ' . $date;
+    } else {
+        // Без товаров - название для начального остатка
+        if (!empty($cardNumber)) {
+            return 'Внесение начального остатка по карте ' . $cardNumber;
+        } else {
+            return 'Внесение начального остатка №' . $receiptNumber . ' от ' . $date;
+        }
+    }
+}
+
+/**
+ * Обновляет название сделки в Bitrix
+ */
+function updateDealTitle($dealId, $newTitle, $logger) {
+    try {
+        $deal = new \CCrmDeal(false);
+        $updateFields = [
+            'TITLE' => $newTitle
+        ];
+        
+        $result = $deal->Update($dealId, $updateFields, true, true);
+        
+        if ($result) {
+            $logger->logSuccess('deal_title_update', $dealId, "Название сделки обновлено", [
+                'old_title' => '', // Можно добавить если нужно
+                'new_title' => $newTitle
+            ]);
+            return true;
+        } else {
+            $error = method_exists($deal, 'GetLAST_ERROR') ? $deal->GetLAST_ERROR() : 'Неизвестная ошибка';
+            $logger->logGeneralError('deal_title_update', $dealId, "Ошибка обновления названия: " . $error);
+            return false;
+        }
+        
+    } catch (Exception $e) {
+        $logger->logGeneralError('deal_title_update', $dealId, "Исключение при обновлении названия: " . $e->getMessage());
+        return false;
+    }
+}
+
+/**
+ * Action для принудительного обновления названий всех сделок (для отладки)
+ */
+function forceUpdateAllDealTitles() {
+    $logger = new JsonLogger();
+    $dateManager = new DateManager();
+    
+    echo "🔄 Принудительное обновление всех названий сделок...\n<br>";
+    
+    try {
+        // Получаем все сделки
+        $deals = DealTable::getList([
+            'select' => ['ID', 'TITLE', 'UF_CRM_1761200496'],
+            'limit' => 5000
+        ])->fetchAll();
+        
+        echo "📊 Получено сделок: " . count($deals) . "\n<br>";
+        
+        $results = [
+            'updated' => [],
+            'skipped' => [],
+            'errors' => []
+        ];
+        
+        // Получаем все покупки из API для анализа
+        $apiPurchases = getAllPurchasesFromApi();
+        $apiPurchasesByReceipt = groupApiPurchasesByReceipt($apiPurchases);
+        
+        foreach ($deals as $deal) {
+            $dealId = $deal['ID'];
+            $currentTitle = $deal['TITLE'] ?? '';
+            $cardNumber = $deal['UF_CRM_1761200496'] ?? '';
+            
+            // Пытаемся извлечь номер чека из названия
+            $receiptNumber = extractReceiptNumberFromTitle($currentTitle);
+            
+            // Ищем в API по номеру чека
+            $foundInApi = false;
+            $apiData = null;
+            
+            if ($receiptNumber) {
+                foreach ($apiPurchasesByReceipt as $key => $apiPurchase) {
+                    if (strpos($key, $receiptNumber) !== false) {
+                        $foundInApi = true;
+                        $apiData = $apiPurchase;
+                        break;
+                    }
+                }
+            }
+            
+            if ($foundInApi && $apiData) {
+                // Определяем новое название на основе данных API
+                $newTitle = determineDealTitle($apiData, $cardNumber, $dateManager);
+            } else {
+                // Если не нашли в API, генерируем по шаблону
+                $newTitle = generateDealTitleFromCurrent($currentTitle, $cardNumber);
+            }
+            
+            // Обновляем если название изменилось
+            if ($currentTitle !== $newTitle) {
+                $updateResult = updateDealTitle($dealId, $newTitle, $logger);
+                
+                if ($updateResult) {
+                    $results['updated'][] = [
+                        'deal_id' => $dealId,
+                        'old_title' => $currentTitle,
+                        'new_title' => $newTitle
+                    ];
+                    echo "✅ Обновлена сделка ID: {$dealId}\n<br>";
+                } else {
+                    $results['errors'][] = [
+                        'deal_id' => $dealId,
+                        'error' => 'Ошибка обновления'
+                    ];
+                }
+            } else {
+                $results['skipped'][] = [
+                    'deal_id' => $dealId,
+                    'reason' => 'Название не изменилось'
+                ];
+            }
+        }
+        
+        echo "\n=== РЕЗУЛЬТАТЫ ===\n<br>";
+        echo "Обновлено: " . count($results['updated']) . "\n<br>";
+        echo "Пропущено: " . count($results['skipped']) . "\n<br>";
+        echo "Ошибок: " . count($results['errors']) . "\n<br>";
+        
+        return $results;
+        
+    } catch (Exception $e) {
+        echo "❌ Ошибка: " . $e->getMessage() . "\n<br>";
+        return ['success' => false, 'error' => $e->getMessage()];
+    }
+}
+
+/**
+ * Извлекает номер чека из названия сделки
+ */
+function extractReceiptNumberFromTitle($title) {
+    if (preg_match('/№\s*(\d+)/', $title, $matches)) {
+        return $matches[1];
+    }
+    
+    if (preg_match('/\b(\d{4,})\b/', $title, $matches)) {
+        // Предполагаем, что длинные числа - это номера чеков
+        if (strlen($matches[1]) >= 4) {
+            return $matches[1];
+        }
+    }
+    
+    return null;
+}
+
+/**
+ * Генерирует название сделки из текущего названия
+ */
+function generateDealTitleFromCurrent($currentTitle, $cardNumber) {
+    // Пытаемся определить, есть ли в названии упоминание о начальном остатке
+    if (stripos($currentTitle, 'остаток') !== false || 
+        stripos($currentTitle, 'внесение') !== false) {
+        
+        if (!empty($cardNumber)) {
+            return 'Внесение начального остатка по карте ' . $cardNumber;
+        } else {
+            return 'Внесение начального остатка';
+        }
+    } else {
+        // Предполагаем, что это обычная продажа
+        $receiptNumber = extractReceiptNumberFromTitle($currentTitle);
+        if ($receiptNumber) {
+            return 'Продажа №' . $receiptNumber;
+        } else {
+            return $currentTitle; // Оставляем как есть
+        }
+    }
+}
+
 if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
     processContactChangeApproval(); // Обработка подтверждений изменений
     processClientsSync(); // Синхронизация клиентов
@@ -5675,8 +6145,8 @@ if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
     }
 } elseif(strpos($_SERVER['REQUEST_URI'], 'action=count') !== false){
     countClientsSumm();
-} elseif(strpos($_SERVER['REQUEST_URI'], 'action=active') !== false){
-
+} elseif(strpos($_SERVER['REQUEST_URI'], 'action=titles') !== false){
+    processDealTitleUpdate();
 } else {
     $result = fetchAllData();
 
