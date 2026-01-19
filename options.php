@@ -6247,7 +6247,7 @@ if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
         $fromDate->setTimestamp($timestamp);
         processRecentPurchases($fromDate);
     }
-    //countClientsSumm();
+    countClientsSumm();
     //require_once ('notify.php');
 } elseif(strpos($_SERVER['REQUEST_URI'], 'action=count') !== false){
     countClientsSumm();
