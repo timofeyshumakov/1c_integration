@@ -5,7 +5,516 @@ use \Bitrix\Main,
     \Bitrix\Crm\DealTable;
 require_once (__DIR__.'/lib/app/crest.php');
 
+
 define('SUPPORT', 3);
+class ClientCardSyncManager {
+    private $entityManager;
+    private $logger;
+    private $apiClient;
+    
+    public function __construct(EntityManager $entityManager, JsonLogger $logger = null) {
+        $this->entityManager = $entityManager;
+        $this->logger = $logger ?: new JsonLogger();
+        $this->apiClient = createApiClient();
+    }
+    
+    /**
+     * Синхронизирует карты для всех клиентов
+     */
+    public function syncCardsForAllClients() {
+        $results = [
+            'processed_clients' => 0,
+            'cards_created' => 0,
+            'cards_updated' => 0,
+            'errors' => []
+        ];
+        
+        try {
+            // 1. Получаем всех клиентов из Bitrix
+            $bitrixClients = $this->getAllBitrixClients();
+            
+            if (empty($bitrixClients)) {
+                echo "Не найдено клиентов в Bitrix\n";
+                return $results;
+            }
+            
+            echo "Найдено клиентов в Bitrix: " . count($bitrixClients) . "\n";
+            
+            // 2. Получаем все карты из API
+            $apiCards = $this->fetchAllCardsFromApi();
+            
+            if (empty($apiCards)) {
+                echo "Не получены карты из API\n";
+                return $results;
+            }
+            
+            echo "Получено карт из API: " . count($apiCards) . "\n";
+            
+            // 3. Группируем карты по коду клиента
+            $cardsByClientCode = $this->groupCardsByClientCode($apiCards);
+            
+            echo "Карт сгруппировано по кодам клиентов: " . count($cardsByClientCode) . "\n";
+            
+            // 4. Обрабатываем каждого клиента
+            foreach ($bitrixClients as $client) {
+                $clientId = $client['ID'];
+                $clientCode = $client['UF_CRM_1760599281'] ?? '';
+                
+                if (empty($clientCode)) {
+                    echo "Пропускаем клиента {$clientId} (отсутствует код клиента)\n";
+                    continue;
+                }
+                
+                echo "\nОбрабатываем клиента: {$clientId}, код: {$clientCode}\n";
+                
+                $clientResults = $this->syncCardsForSingleClient(
+                    $clientId, 
+                    $clientCode, 
+                    $cardsByClientCode[$clientCode] ?? []
+                );
+                
+                $results['processed_clients']++;
+                $results['cards_created'] += $clientResults['created'];
+                $results['cards_updated'] += $clientResults['updated'];
+                
+                if (!empty($clientResults['error'])) {
+                    $results['errors'][] = [
+                        'client_id' => $clientId,
+                        'client_code' => $clientCode,
+                        'error' => $clientResults['error']
+                    ];
+                }
+            }
+            
+            echo "\n=== РЕЗУЛЬТАТЫ СИНХРОНИЗАЦИИ КАРТ ===\n";
+            echo "Обработано клиентов: {$results['processed_clients']}\n";
+            echo "Создано карт: {$results['cards_created']}\n";
+            echo "Обновлено карт: {$results['cards_updated']}\n";
+            echo "Ошибок: " . count($results['errors']) . "\n";
+            
+            return $results;
+            
+        } catch (Exception $e) {
+            $this->logger->logGeneralError('card_sync', 'batch', "Ошибка синхронизации карт: " . $e->getMessage());
+            throw $e;
+        }
+    }
+    
+    /**
+     * Получает всех клиентов из Bitrix
+     */
+    private function getAllBitrixClients() {
+        $clients = [];
+        
+        try {
+            
+            for ($i=0; $i < 10; $i++) { 
+                $result = CRest::call('crm.contact.list', [
+                    'filter' => [
+                        '!UF_CRM_1760599281' => false, // Только с кодом клиента
+                    ],
+                    'select' => ['ID', 'UF_CRM_1760599281', 'NAME', 'LAST_NAME'],
+                    'order' => ['ID' => 'DESC'],
+                    'start' => $i * 50,
+                ]);
+                $clients = array_merge($clients, $result['result']);
+            }
+
+        } catch (Exception $e) {
+            error_log("Ошибка при получении клиентов из Bitrix: " . $e->getMessage());
+        }
+        
+        return $clients;
+    }
+    
+    /**
+     * Получает все карты из API
+     */
+    private function fetchAllCardsFromApi() {
+        $apiConfig = getApiCredentials();
+        
+        $client = new ApiClient(
+            $apiConfig['username'] ?? '', 
+            $apiConfig['password'] ?? '', 
+            $apiConfig['base_url'] ?? ''
+        );
+        
+        $result = $client->makeRequest('cards', 'GET');
+        
+        if ($result['success'] && !empty($result['response'])) {
+            return json_decode($result['response'], JSON_UNESCAPED_UNICODE) ?: [];
+        }
+        
+        $this->logger->logGeneralError('card_sync', 'api', "Не удалось получить карты из API", [
+            'http_code' => $result['http_code'] ?? 0,
+            'error' => $result['error'] ?? 'Неизвестная ошибка'
+        ]);
+        
+        return [];
+    }
+    
+    /**
+     * Группирует карты по коду клиента
+     */
+    private function groupCardsByClientCode($apiCards) {
+        $groupedCards = [];
+        
+        foreach ($apiCards as $card) {
+            $clientCode = $card['client'] ?? '';
+            
+            if (!empty($clientCode)) {
+                if (!isset($groupedCards[$clientCode])) {
+                    $groupedCards[$clientCode] = [];
+                }
+                $groupedCards[$clientCode][] = $card;
+            }
+        }
+        
+        return $groupedCards;
+    }
+    
+    /**
+     * Синхронизирует карты для одного клиента
+     */
+    private function syncCardsForSingleClient($clientId, $clientCode, $apiCards) {
+        $results = [
+            'created' => 0,
+            'updated' => 0,
+            'error' => null
+        ];
+        
+        try {
+            echo "Найдено карт в API для клиента {$clientCode}: " . count($apiCards) . "\n";
+            
+            // Получаем существующие карты клиента из Bitrix
+            $existingCards = $this->getClientCardsFromBitrix($clientId);
+            
+            echo "Существующих карт в Bitrix: " . count($existingCards) . "\n";
+            
+            // Создаем/обновляем карты из API
+            foreach ($apiCards as $apiCard) {
+                $cardResult = $this->syncSingleCard($apiCard, $clientId, $existingCards);
+                
+                if ($cardResult['status'] === 'created') {
+                    $results['created']++;
+                    echo "  ✅ Создана карта: {$cardResult['card_number']}\n";
+                } elseif ($cardResult['status'] === 'updated') {
+                    $results['updated']++;
+                    echo "  🔄 Обновлена карта: {$cardResult['card_number']}\n";
+                } elseif ($cardResult['status'] === 'no_changes') {
+                    echo "  ➡️  Без изменений: {$cardResult['card_number']}\n";
+                }
+            }
+            
+            // Логируем карты, которые есть в Bitrix но отсутствуют в API
+            $this->logMissingCards($clientId, $clientCode, $existingCards, $apiCards);
+            
+            // Обновляем поле активной карты
+            $this->updateActiveCardField($clientId);
+            
+        } catch (Exception $e) {
+            $results['error'] = $e->getMessage();
+            $this->logger->logGeneralError('client_card_sync', $clientId, "Ошибка синхронизации карт клиента: " . $e->getMessage(), [
+                'client_code' => $clientCode,
+                'api_cards_count' => count($apiCards)
+            ]);
+            echo "  ❌ Ошибка: " . $e->getMessage() . "\n";
+        }
+        
+        return $results;
+    }
+    
+    /**
+     * Получает карты клиента из Bitrix
+     */
+    private function getClientCardsFromBitrix($clientId) {
+        $cards = [];
+        
+        try {
+            $factory = Service\Container::getInstance()->getFactory(1038);
+            
+            if (!$factory) {
+                return $cards;
+            }
+            
+            $items = $factory->getItems([
+                'filter' => [
+                    '=CONTACT_ID' => $clientId
+                ],
+                'select' => ['ID', 'UF_CRM_3_1759320971349', 'UF_CRM_3_1759315419431']
+            ]);
+            
+            foreach ($items as $item) {
+                $cards[] = [
+                    'id' => $item->getId(),
+                    'number' => $item->get('UF_CRM_3_1759320971349'),
+                    'is_blocked' => $item->get('UF_CRM_3_1759315419431')
+                ];
+            }
+            
+        } catch (Exception $e) {
+            error_log("Ошибка при получении карт клиента {$clientId}: " . $e->getMessage());
+        }
+        
+        return $cards;
+    }
+    
+    /**
+     * Синхронизирует одну карту
+     */
+    private function syncSingleCard($apiCard, $clientId, $existingCards) {
+        $cardNumber = $apiCard['number'] ?? 'unknown';
+        
+        // Проверяем, существует ли уже карта
+        $existingCard = $this->findCardInArray($cardNumber, $existingCards);
+        
+        if ($existingCard) {
+            // Обновляем существующую карту
+            return $this->updateExistingCard($existingCard['id'], $apiCard, $clientId);
+        } else {
+            // Создаем новую карту
+            return $this->createNewCard($apiCard, $clientId);
+        }
+    }
+    
+    /**
+     * Ищет карту в массиве по номеру
+     */
+    private function findCardInArray($cardNumber, $cards) {
+        foreach ($cards as $card) {
+            if ($card['number'] === $cardNumber) {
+                return $card;
+            }
+        }
+        return null;
+    }
+    
+    /**
+     * Обновляет существующую карту
+     */
+    private function updateExistingCard($cardId, $apiCard, $clientId) {
+        $dateManager = new DateManager();
+        
+        try {
+            $factory = Service\Container::getInstance()->getFactory(1038);
+            
+            if (!$factory) {
+                throw new Exception("Фабрика карт не найдена");
+            }
+            
+            $card = $factory->getItem($cardId);
+            
+            if (!$card) {
+                throw new Exception("Карта не найдена");
+            }
+            
+            // Получаем текущие данные
+            $currentData = $card->getCompatibleData();
+            
+            // Проверяем, есть ли изменения
+            $updateFields = [];
+            $hasChanges = false;
+            
+            // Блокировка карты
+            $newBlocked = $apiCard['is_blocked'] ?? 0;
+            $currentBlocked = $currentData['UF_CRM_3_1759315419431'] ?? 0;
+            if ($newBlocked != $currentBlocked) {
+                $updateFields['UF_CRM_3_1759315419431'] = $newBlocked;
+                $hasChanges = true;
+            }
+            
+            // Тип карты
+            $newType = $apiCard['discount_card_type'] ?? 'STANDARD';
+            $currentType = $currentData['UF_CRM_3_1760598956'] ?? 'STANDARD';
+            if ($newType !== $currentType) {
+                $updateFields['UF_CRM_3_1760598956'] = $newType;
+                $hasChanges = true;
+            }
+            
+            // Дата заявки
+            $newAppDate = $dateManager->formatDate($apiCard['application_date'] ?? '');
+            $currentAppDate = $currentData['UF_CRM_3_1759317288635'] ?? '';
+            if ($newAppDate !== $currentAppDate) {
+                $updateFields['UF_CRM_3_1759317288635'] = $newAppDate;
+                $hasChanges = true;
+            }
+            
+            // Код склада
+            $newWarehouse = $apiCard['warehouse_code'] ?? '';
+            $currentWarehouse = $currentData['UF_CRM_3_1760598832'] ?? '';
+            if ($newWarehouse !== $currentWarehouse) {
+                $updateFields['UF_CRM_3_1760598832'] = $newWarehouse;
+                $hasChanges = true;
+            }
+            
+            if (!$hasChanges) {
+                return [
+                    'status' => 'no_changes',
+                    'card_number' => $apiCard['number'] ?? '',
+                    'card_id' => $cardId
+                ];
+            }
+            
+            // Обновляем карту
+            $card->setFromCompatibleData($updateFields);
+            $operation = $factory->getUpdateOperation($card);
+            $operationResult = $operation->launch();
+            
+            if ($operationResult->isSuccess()) {
+                return [
+                    'status' => 'updated',
+                    'card_number' => $apiCard['number'] ?? '',
+                    'card_id' => $cardId,
+                    'changes' => array_keys($updateFields)
+                ];
+            } else {
+                throw new Exception("Ошибка при обновлении карты");
+            }
+            
+        } catch (Exception $e) {
+            throw new Exception("Ошибка обновления карты {$cardId}: " . $e->getMessage());
+        }
+    }
+    
+    /**
+     * Создает новую карту
+     */
+    private function createNewCard($apiCard, $clientId) {
+        $dateManager = new DateManager();
+        
+        try {
+            $cardFields = [
+                'TITLE' => $apiCard['number'] ?? 'Новая карта',
+                'UF_CRM_3_1759320971349' => $apiCard['number'] ?? '',
+                'UF_CRM_3_CLIENT' => $clientId,
+                'CONTACT_ID' => $clientId,
+                'UF_CRM_3_1759315419431' => $apiCard['is_blocked'] ?? 0,
+                'UF_CRM_3_1760598978' => $apiCard['client'] ?? $apiCard['number'],
+                'UF_CRM_3_1759317288635' => $dateManager->formatDate($apiCard['application_date'] ?? ''),
+                'UF_CRM_3_1760598832' => $apiCard['warehouse_code'] ?? '',
+                'UF_CRM_3_1760598956' => $apiCard['discount_card_type'] ?? 'STANDARD'
+            ];
+            
+            $cardId = $this->entityManager->createSp($cardFields, 1038);
+            
+            if ($cardId) {
+                return [
+                    'status' => 'created',
+                    'card_number' => $apiCard['number'] ?? '',
+                    'card_id' => $cardId
+                ];
+            } else {
+                throw new Exception("Не удалось создать карту");
+            }
+            
+        } catch (Exception $e) {
+            throw new Exception("Ошибка создания карты: " . $e->getMessage());
+        }
+    }
+    
+    /**
+     * Логирует карты, которые есть в Bitrix но отсутствуют в API
+     */
+    private function logMissingCards($clientId, $clientCode, $existingCards, $apiCards) {
+        $apiCardNumbers = array_column($apiCards, 'number');
+        $missingCards = [];
+        
+        foreach ($existingCards as $existingCard) {
+            if (!in_array($existingCard['number'], $apiCardNumbers)) {
+                $missingCards[] = $existingCard['number'];
+            }
+        }
+        
+        if (!empty($missingCards)) {
+            $this->logger->logGeneralError('missing_cards', $clientId, "Карты в Bitrix отсутствуют в API", [
+                'client_id' => $clientId,
+                'client_code' => $clientCode,
+                'missing_cards' => $missingCards,
+                'total_missing' => count($missingCards)
+            ]);
+            
+            echo "  ⚠️  Карты в Bitrix отсутствуют в API: " . count($missingCards) . "\n";
+            foreach ($missingCards as $card) {
+                echo "    - {$card}\n";
+            }
+        }
+    }
+    
+    /**
+     * Обновляет поле активной карты у клиента
+     */
+    private function updateActiveCardField($clientId) {
+        try {
+            // Находим активную карту (не заблокированную)
+            $factory = Service\Container::getInstance()->getFactory(1038);
+            
+            if (!$factory) {
+                return false;
+            }
+            
+            $items = $factory->getItems([
+                'filter' => [
+                    '=CONTACT_ID' => $clientId,
+                    '=UF_CRM_3_1759315419431' => 'N' // Не заблокирована
+                ],
+                'select' => ['ID'],
+                'order' => ['ID' => 'DESC'],
+                'limit' => 1
+            ]);
+            
+            if (!empty($items)) {
+                $activeCardId = $items[0]->getId();
+                
+                // Обновляем поле у контакта
+                $contact = new \CCrmContact(false);
+                $updateFields = [
+                    'UF_CRM_1764916739' => $activeCardId
+                ];
+                
+                $result = $contact->Update($clientId, $updateFields, true, true);
+                
+                if ($result) {
+                    echo "  ✅ Обновлено поле активной карты\n";
+                    return true;
+                }
+            } else {
+                // Если нет активных карт, очищаем поле
+                $contact = new \CCrmContact(false);
+                $updateFields = [
+                    'UF_CRM_1764916739' => null
+                ];
+                
+                $contact->Update($clientId, $updateFields, true, true);
+                echo "  🔄 Очищено поле активной карты (нет активных карт)\n";
+            }
+            
+            return false;
+            
+        } catch (Exception $e) {
+            echo "  ⚠️  Ошибка обновления активной карты: " . $e->getMessage() . "\n";
+            return false;
+        }
+    }
+}
+
+/**
+ * Точка входа для синхронизации карт
+ */
+function syncClientCards() {
+    $logger = new JsonLogger();
+    $entityManager = new EntityManager(new DateManager(), new ImageProcessor(), $logger);
+    $cardSyncManager = new ClientCardSyncManager($entityManager, $logger);
+    
+    echo "🔄 Начинаем синхронизацию карт клиентов...\n";
+    
+    $startTime = microtime(true);
+    $results = $cardSyncManager->syncCardsForAllClients();
+    $executionTime = round(microtime(true) - $startTime, 2);
+    
+    echo "\nВремя выполнения: {$executionTime} сек.\n";
+    
+    return $results;
+}
 
 class ContactChangesTracker {
     private $changesFile;
@@ -105,12 +614,12 @@ class ContactChangesTracker {
     /**
      * Регистрирует изменение контакта
      */
-    public function registerContactChange($contactId, $field, $oldValue, $newValue, $changedBy = 'system') {
+    public function registerContactChange($existingClient, $field, $oldValue, $newValue, $changedBy = 'system') {
         // Пропускаем пустые изменения
         if ($oldValue === $newValue) {
             return false;
         }
-        
+        $contactId = $existingClient['ID'];
         // Проверяем дублирование
         if ($this->isDuplicateChange($contactId, $field, $newValue)) {
             $this->logger->logGeneralError('contact_change', $contactId, "Дублирующее изменение пропущено", [
@@ -128,6 +637,9 @@ class ContactChangesTracker {
             'field_name' => $this->getFieldDisplayName($field),
             'old_value' => $oldValue,
             'new_value' => $newValue,
+            'last_name' => $existingClient['LAST_NAME'],
+            'name' => $existingClient['NAME'],
+            'second_name' => $existingClient['SECOND_NAME'],
             'changed_by' => $changedBy,
             'status' => 'pending', // pending, approved, rejected
             'approved_by' => null,
@@ -2638,11 +3150,19 @@ private function addProductToDeal($dealId, $product, $count, $price) {
                     }
                 }
                 $item["title"] = '';
-                if ($item["sum"] > 0) {
-                    $item["title"] = 'Продажа №' . $item["receipt_number"] . ' от ' . $item['receipt_date'] === '0001-01-01T00:00:00' ? $dateManager->formatDate($item["date"] ?? '') : $dateManager->formatDate($item["receipt_date"] ?? '');
-                } elseif ($item["sum"] < 0) {
-                    $item["title"] = '';
-                }
+                // Определяем тип операции
+                $operationType = ((int)$item["sum"] > 0) ? 'Продажа' : 'Возврат';
+
+                // Определяем дату для вывода
+                $dateToShow = ($item['receipt_date'] === '0001-01-01T00:00:00') 
+                    ? $item["date"] ?? '' 
+                    : $item["receipt_date"] ?? '';
+
+                // Форматируем дату
+                $formattedDate = $dateManager->formatDate($dateToShow);
+
+                // Формируем заголовок
+                $item["title"] = $operationType . ' №' . $item["receipt_number"] . ' от ' . $formattedDate;
 
                 $todayMinusThreeDays = new DateTime(date('Y-m-d', strtotime('-3 days')));
                 $purchaseDate = new DateTime($item['receipt_date'] === '0001-01-01T00:00:00' ? $item["date"] : $item['receipt_date']);
@@ -3264,11 +3784,19 @@ function createDealWithMultipleProducts($purchasesGroup, $entityManager, $logger
     $firstPurchase = $purchasesGroup[0];
     $entityId = $firstPurchase["receipt_number"] ?? 'unknown';
                 $firstPurchase["title"] = '';
-                if ((int)$firstPurchase["sum"] > 0) {
-                    $firstPurchase["title"] = 'Продажа №' . $firstPurchase["receipt_number"] . ' от ' . $firstPurchase['receipt_date'] === '0001-01-01T00:00:00' ? $dateManager->formatDate($firstPurchase["date"] ?? '') : $dateManager->formatDate($firstPurchase["receipt_date"] ?? '');
-                } elseif ((int)$firstPurchase["sum"] < 0) {
-                    $firstPurchase["title"] = 'Возврат №' . $firstPurchase["receipt_number"] . ' от ' . $firstPurchase['receipt_date'] === '0001-01-01T00:00:00' ? $dateManager->formatDate($firstPurchase["date"] ?? '') : $dateManager->formatDate($firstPurchase["receipt_date"] ?? '');
-                }
+    // Определяем тип операции
+    $operationType = ((int)$firstPurchase["sum"] > 0) ? 'Продажа' : 'Возврат';
+
+    // Определяем дату для вывода
+    $dateToShow = ($firstPurchase['receipt_date'] === '0001-01-01T00:00:00') 
+        ? $firstPurchase["date"] ?? '' 
+        : $firstPurchase["receipt_date"] ?? '';
+
+    // Форматируем дату
+    $formattedDate = $dateManager->formatDate($dateToShow);
+
+    // Формируем заголовок
+    $firstPurchase["title"] = $operationType . ' №' . $firstPurchase["receipt_number"] . ' от ' . $formattedDate;
                 $todayMinusThreeDays = new DateTime(date('Y-m-d', strtotime('-3 days')));
                 $purchaseDate = new DateTime($firstPurchase['receipt_date'] === '0001-01-01T00:00:00' ? $firstPurchase["date"] : $firstPurchase['receipt_date']);
 
@@ -3382,20 +3910,18 @@ function createDealWithMultipleProducts($purchasesGroup, $entityManager, $logger
 }
 function filterRecentPurchases($purchases, $fromDate) {
     $recentPurchases = [];
-    print_r($purchases);
-    print_r($fromDate);
+
     foreach ($purchases as $purchase) {
         if (empty($purchase['receipt_date'])) {
             continue;
         }
         // Парсим дату из формата "2025-05-19T20:03:56"
-        $purchaseDate = DateTime::createFromFormat('Y-m-d\TH:i:s', $purchase['receipt_date'] === '0001-01-01T00:00:00' ? $purchase['date'] : $purchase['receipt_date']);
+        $purchaseDate = DateTime::createFromFormat('Y-m-d\TH:i:s', $purchase['date']);
         
         if ($purchaseDate === false) {
             continue;
         }
-        print_r($purchaseDate);
-        print_r($purchaseDate >= $fromDate);
+
         // Проверяем, находится ли дата в пределах последних 3 минут
         if ($purchaseDate >= $fromDate) {
             $recentPurchases[] = $purchase;
@@ -3970,7 +4496,7 @@ private function findCardByClientId($clientId) {
                     ]
                 ]
         )["total"];
-        $create = count($apiClients) > $bxClientsCount;
+        $create = true;//count($apiClients) > $bxClientsCount; раскоментить
 
         // Начальное время запуска скрипта
         $startTime = microtime(true);
@@ -3988,20 +4514,21 @@ private function findCardByClientId($clientId) {
             }
 
             $clientCode = $clientData['code'] ?? 'unknown';
-            if(true){
-               // $clientData['middle_name'] = 'test';
+            if(true){ //in_array($clientData['code'], ['00000041600', '00000069109', '00000075975', '00000078375', '00000078431', '00000069908'])){
+
             try {
                 // Синхронизируем клиента
                 $syncResult = $this->syncSingleClient($clientData, $create);
-                print_r($syncResult);
                 if ($syncResult['status'] === 'created') {
                     $results['created'][] = $syncResult;
-                    $this->findAndCreateDealsForClient($syncResult['bitrix_id'], $clientCode);
+                    //$this->findAndCreateDealsForClient($syncResult['bitrix_id'], $clientCode);
                     echo "✅ Создан клиент: {$clientCode} (ID: {$syncResult['bitrix_id']})\n";
                 } elseif ($syncResult['status'] === 'updated') {
                     $results['updated'][] = $syncResult;
+                    //$this->findAndCreateDealsForClient($syncResult['bitrix_id'], $clientCode);
                     echo "🔄 Обновлен клиент: {$clientCode} (ID: {$syncResult['bitrix_id']})\n";
                 } elseif ($syncResult['status'] === 'no_changes') {
+                    //$this->findAndCreateDealsForClient($syncResult['bitrix_id'], $clientCode);
                     echo "➡️  Без изменений: {$clientCode}\n";
                 }
 
@@ -4110,7 +4637,7 @@ private function findCardByClientId($clientId) {
         $registeredChanges = [];
         foreach ($changes as $field => $changeData) {
             $changeId = $this->changesTracker->registerContactChange(
-                $contactId,
+                $existingClient,
                 $field,
                 $changeData['from'],
                 $changeData['to'],
@@ -4252,30 +4779,30 @@ private function findCardByClientId($clientId) {
     private function updateClient($clientId, $updateFields) {
         try {
 
-$arMessageFields = array(
-    // получатель
-    "TO_USER_ID" => 78,
-    // отправитель
-    "FROM_USER_ID" => 0, 
-    // тип уведомления
-    "NOTIFY_TYPE" => 1,
-    // текст уведомления на сайте (доступен html и бб-коды)
-    "NOTIFY_MESSAGE" => "Приглашаю вас принять участие во встрече “Мгновенные сообщения и уведомления” которая состоится 15.03.2012 в 14:00",
-    "NOTIFY_MODULE" => "im",
-    // массив описывающий кнопки уведомления
-    // в вашем модуле yourmodule в классе CYourModuleEvents в методе CYourModuleEventsIMCallback пишем функцию обработку события
-    "NOTIFY_BUTTONS" => Array(
-        // 1. название кнопки, 2. значение, 3. шаблон кнопки, 4. переход по адресу после нажатия (не обязательный параметр)
-        Array('TITLE' => 'Принять', 'VALUE' => 'Y', 'TYPE' => 'accept' /*, 'URL' => 'http://test.ru/?confirm=Y' */),
-        Array('TITLE' => 'Отказаться', 'VALUE' => 'N', 'TYPE' => 'cancel' /*, 'URL' => 'http://test.ru/?confirm=N' */),
-    ),
-    // символьный код шаблона отправки письма, если не задавать отправляется шаблоном уведомлений
-    "NOTIFY_EMAIL_TEMPLATE" => "CALENDAR_INVITATION",
-);
+        $arMessageFields = array(
+            // получатель
+            "TO_USER_ID" => 78,
+            // отправитель
+            "FROM_USER_ID" => 0, 
+            // тип уведомления
+            "NOTIFY_TYPE" => 1,
+            // текст уведомления на сайте (доступен html и бб-коды)
+            "NOTIFY_MESSAGE" => "Приглашаю вас принять участие во встрече “Мгновенные сообщения и уведомления” которая состоится 15.03.2012 в 14:00",
+            "NOTIFY_MODULE" => "im",
+            // массив описывающий кнопки уведомления
+            // в вашем модуле yourmodule в классе CYourModuleEvents в методе CYourModuleEventsIMCallback пишем функцию обработку события
+            "NOTIFY_BUTTONS" => Array(
+                // 1. название кнопки, 2. значение, 3. шаблон кнопки, 4. переход по адресу после нажатия (не обязательный параметр)
+                Array('TITLE' => 'Принять', 'VALUE' => 'Y', 'TYPE' => 'accept' /*, 'URL' => 'http://test.ru/?confirm=Y' */),
+                Array('TITLE' => 'Отказаться', 'VALUE' => 'N', 'TYPE' => 'cancel' /*, 'URL' => 'http://test.ru/?confirm=N' */),
+            ),
+            // символьный код шаблона отправки письма, если не задавать отправляется шаблоном уведомлений
+            "NOTIFY_EMAIL_TEMPLATE" => "CALENDAR_INVITATION",
+        );
 
-if(CModule::IncludeModule("im")){
-    CIMNotify::Add($arMessageFields);
-}
+        if(CModule::IncludeModule("im")){
+            CIMNotify::Add($arMessageFields);
+        }
 
             /*
             $contact = new \CCrmContact(false);
@@ -4913,14 +5440,15 @@ if(CModule::IncludeModule("im")){
 
         } else {
             $syncResult = $this->updateClientIfChanged($existingClient, $clientData);
-            return $syncResult;
+            //return $syncResult;
             // Обновляем клиента и синхронизируем все карты
             
             
             // После обновления клиента синхронизируем все его карты и сделки
             if ($syncResult['status'] !== 'error') {
-                $this->findAndCreateDealsForAllClientCards($existingClient['id'], $clientCode);
+                $this->findAndCreateDealsForAllClientCards($existingClient['ID'], $clientCode);
             }
+                        return $syncResult;
         }
     }
 
@@ -5706,138 +6234,86 @@ function updateContactCardField($contactId, $cardId, $logger) {
     }
 }
 
+if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
+    //processContactChangeApproval(); // Обработка подтверждений изменений
+    processClientsSync(); // Синхронизация клиентов
+    //syncClientCards();
+} elseif(strpos($_SERVER['REQUEST_URI'], 'action=update') !== false){
+    //processClientsSync();
+    // Проверяем наличие параметра date
+    if(isset($_REQUEST['date']) && !empty($_REQUEST['date'])) {
+        $timestamp = $_REQUEST['date'];
+        $fromDate = new DateTime();
+        $fromDate->setTimestamp($timestamp);
+        processRecentPurchases($fromDate);
+    }
+    //countClientsSumm();
+    //require_once ('notify.php');
+} elseif(strpos($_SERVER['REQUEST_URI'], 'action=count') !== false){
+    countClientsSumm();
+} elseif(strpos($_SERVER['REQUEST_URI'], 'action=deduplicate_deals') !== false) {
+    processDealDeduplication();
+} elseif(strpos($_SERVER['REQUEST_URI'], 'action=add_photo') !== false) {
+    processUpdateProductPhotos();
+} else {
+    $result = fetchAllData();
+    echo "<pre>";
+    print_r($result);
+    echo "</pre>";
+}
 
-
-
-/**
- * Action для обновления названий сделок на основе данных API
- * Ищет сделки в Bitrix, сверяет их с данными API и обновляет названия
- */
-function processDealTitleUpdate() {
-    $logger = new JsonLogger();
-    $dateManager = new DateManager();
-    
-    echo "🔄 Начинаем обновление названий сделок...\n<br>";
+// Добавляем функцию processDealDeduplication() перед последним закрывающим тегом
+function processDealDeduplication() {
+    echo "🔍 Поиск и обработка дубликатов сделок...\n<br>";
     
     try {
-        // 1. Получаем все сделки из Bitrix с нужными полями
-        $deals = getAllBitrixDeals();
-        echo "📊 Получено сделок из Bitrix: " . count($deals) . "\n<br>";
-        print_r($deals);
-        // 2. Получаем все покупки из API
-        $apiPurchases = getAllPurchasesFromApi();
-        echo "📊 Получено покупок из API: " . count($apiPurchases) . "\n<br>";
+        // Ищем все сделки с группировкой по названию
+        $duplicateDeals = findDuplicateDeals();
         
-        // 3. Группируем покупки из API по номеру чека и дате для быстрого поиска
-        $apiPurchasesByReceipt = groupApiPurchasesByReceipt($apiPurchases);
-        echo "📊 Сгруппировано чеков в API: " . count($apiPurchasesByReceipt) . "\n<br>";
-  
-        $results = [
-            'updated' => [],
-            'skipped' => [],
-            'errors' => [],
-            'not_found_in_api' => []
+        if (empty($duplicateDeals)) {
+            echo "✅ Дубликаты сделок не найдены.\n<br>";
+            return [
+                'success' => true,
+                'message' => 'Дубликаты сделок не найдены',
+                'total_groups' => 0,
+                'deleted_deals' => 0,
+                'kept_deals' => 0
+            ];
+        }
+        
+        echo "Найдено групп дубликатов: " . count($duplicateDeals) . "\n<br>";
+        
+        $totalDeleted = 0;
+        $totalKept = 0;
+        
+        // Обрабатываем каждую группу дубликатов
+        foreach ($duplicateDeals as $dealTitle => $deals) {
+            echo "\n--- Группа: '{$dealTitle}' ---\n<br>";
+            echo "Количество сделок в группе: " . count($deals) . "\n<br>";
+            
+            // Обрабатываем дубликаты в группе
+            $result = processDuplicateGroup($deals);
+            
+            $totalDeleted += $result['deleted'];
+            $totalKept += $result['kept'];
+            
+            echo "Результат: удалено {$result['deleted']}, оставлено {$result['kept']}\n<br>";
+        }
+        
+        echo "\n=== ИТОГИ ОБРАБОТКИ ДУБЛИКАТОВ ===\n<br>";
+        echo "Всего групп: " . count($duplicateDeals) . "\n<br>";
+        echo "Удалено сделок: {$totalDeleted}\n<br>";
+        echo "Оставлено сделок: {$totalKept}\n<br>";
+        
+        return [
+            'success' => true,
+            'total_groups' => count($duplicateDeals),
+            'deleted_deals' => $totalDeleted,
+            'kept_deals' => $totalKept
         ];
-
-        // 4. Обрабатываем каждую сделку из Bitrix
-        foreach ($deals as $deal) {
-            $dealId = $deal['ID'];
-            $receiptNumber = $deal['UF_CRM_1756711109104'] ?? '';
-            $sellDate = $deal['UF_CRM_1760529583'] ?? '';
-            $currentTitle = $deal['TITLE'] ?? '';
-            $cardNumber = $deal['UF_CRM_1761200496'] ?? '';
-
-            if (empty($receiptNumber) || empty($sellDate)) {
-                $results['skipped'][] = [
-                    'deal_id' => $dealId,
-                    'reason' => 'Отсутствует номер чека или дата продажи'
-                ];
-                continue;
-            }
-            
-            // Формируем ключ для поиска в API данных
-            $receiptKey = createReceiptKey($receiptNumber, $sellDate);
-            
-            // Ищем покупку в API данных
-            if (isset($apiPurchasesByReceipt[$receiptKey])) {
-                $apiPurchase = $apiPurchasesByReceipt[$receiptKey];
-                
-                // Определяем тип сделки (с товарами или без)
-                $newTitle = determineDealTitle($apiPurchase, $cardNumber, $dateManager);
-                
-                // Сравниваем текущее название с новым
-                if ($currentTitle !== $newTitle) {
-                    $updateResult = updateDealTitle($dealId, $newTitle, $logger);
-                    
-                    if ($updateResult) {
-                        $results['updated'][] = [
-                            'deal_id' => $dealId,
-                            'old_title' => $currentTitle,
-                            'new_title' => $newTitle,
-                            'receipt_number' => $receiptNumber,
-                            'card_number' => $cardNumber
-                        ];
-                        echo "✅ Обновлена сделка ID: {$dealId}, чек: {$receiptNumber}\n<br>";
-                        echo "   Старое название: {$currentTitle}\n<br>";
-                        echo "   Новое название: {$newTitle}\n<br>";
-                    } else {
-                        $results['errors'][] = [
-                            'deal_id' => $dealId,
-                            'receipt_number' => $receiptNumber,
-                            'error' => 'Ошибка обновления в БД'
-                        ];
-                        echo "❌ Ошибка обновления сделки ID: {$dealId}\n<br>";
-                    }
-                } else {
-                    $results['skipped'][] = [
-                        'deal_id' => $dealId,
-                        'reason' => 'Название уже актуальное',
-                        'title' => $currentTitle
-                    ];
-                }
-            } else {
-                $results['not_found_in_api'][] = [
-                    'deal_id' => $dealId,
-                    'receipt_number' => $receiptNumber,
-                    'sell_date' => $sellDate
-                ];
-                echo "ℹ️ Не найдено в API: сделка {$dealId}, чек {$receiptNumber}\n<br>";
-            }
-        }
-        
-        // 5. Выводим результаты
-        echo "\n\n=== РЕЗУЛЬТАТЫ ОБНОВЛЕНИЯ НАЗВАНИЙ СДЕЛОК ===\n<br>";
-        echo "Всего обработано сделок: " . count($deals) . "\n<br>";
-        echo "Обновлено: " . count($results['updated']) . "\n<br>";
-        echo "Пропущено: " . count($results['skipped']) . "\n<br>";
-        echo "Ошибок: " . count($results['errors']) . "\n<br>";
-        echo "Не найдено в API: " . count($results['not_found_in_api']) . "\n<br>";
-        
-        // Детальная статистика
-        if (!empty($results['updated'])) {
-            echo "\n--- Обновленные сделки ---\n<br>";
-            foreach ($results['updated'] as $updated) {
-                echo "Сделка ID: {$updated['deal_id']}, Чек: {$updated['receipt_number']}\n<br>";
-                echo "   Было: {$updated['old_title']}\n<br>";
-                echo "   Стало: {$updated['new_title']}\n<br>";
-            }
-        }
-        
-        // Логируем результаты
-        $logger->logGeneralError('deal_title_update', 'batch', "Обновление названий сделок завершено", [
-            'total_deals' => count($deals),
-            'updated' => count($results['updated']),
-            'skipped' => count($results['skipped']),
-            'errors' => count($results['errors']),
-            'not_found_in_api' => count($results['not_found_in_api']),
-            'details' => $results
-        ]);
-        
-        return $results;
         
     } catch (Exception $e) {
-        echo "❌ Критическая ошибка: " . $e->getMessage() . "\n<br>";
-        $logger->logGeneralError('deal_title_update', 'batch', "Критическая ошибка: " . $e->getMessage());
+        echo "❌ Ошибка при обработке дубликатов: " . $e->getMessage() . "\n<br>";
         return [
             'success' => false,
             'error' => $e->getMessage()
@@ -5846,316 +6322,579 @@ function processDealTitleUpdate() {
 }
 
 /**
- * Получает все сделки из Bitrix с необходимыми полями
+ * Находит дубликаты сделок по названию
  */
-function getAllBitrixDeals() {
-    try {
-        echo 'lol';
-        $deals = DealTable::getList([
-            'select' => [
-                'ID',
-                'TITLE',
-            ]
-        ])->fetchAll();
-        print_r($deals);
-        return $deals;
-        
-    } catch (Exception $e) {
-        error_log("Ошибка при получении сделок из Bitrix: " . $e->getMessage());
-        return [];
-    }
-}
-
-/**
- * Получает все покупки из API
- */
-function getAllPurchasesFromApi() {
-    $apiConfig = getApiCredentials();
-    $client = new ApiClient(
-        $apiConfig['username'] ?? '', 
-        $apiConfig['password'] ?? '', 
-        $apiConfig['base_url'] ?? ''
-    );
-    
-    $result = $client->makeRequest('purchases', 'GET');
-    
-    if ($result['success']) {
-        return json_decode($result['response'], JSON_UNESCAPED_UNICODE) ?: [];
-    }
-    
-    return [];
-}
-
-/**
- * Группирует покупки из API по номеру чека и дате
- */
-function groupApiPurchasesByReceipt($apiPurchases) {
-    $grouped = [];
-    $dateManager = new DateManager();
-    
-    foreach ($apiPurchases as $purchase) {
-        $receiptNumber = $purchase['receipt_number'] ?? '';
-        $date = $purchase['receipt_date'] === '0001-01-01T00:00:00' 
-            ? $dateManager->formatDate($purchase["date"] ?? '') 
-            : $dateManager->formatDate($purchase["receipt_date"] ?? '');
-        
-        if (!empty($receiptNumber) && !empty($date)) {
-            $key = createReceiptKey($receiptNumber, $date);
-            
-            // Если для этого чека уже есть запись, объединяем информацию о товарах
-            if (isset($grouped[$key])) {
-                $grouped[$key]['has_items'] = $grouped[$key]['has_items'] || !empty($purchase['item_name']);
-                $grouped[$key]['purchases'][] = $purchase;
-            } else {
-                $grouped[$key] = [
-                    'receipt_number' => $receiptNumber,
-                    'date' => $date,
-                    'card_number' => $purchase['card_number'] ?? '',
-                    'has_items' => !empty($purchase['item_name']),
-                    'purchases' => [$purchase]
-                ];
-            }
-        }
-    }
-    
-    return $grouped;
-}
-
-/**
- * Создает ключ для группировки по номеру чека и дате
- */
-function createReceiptKey($receiptNumber, $date) {
-    // Нормализуем дату к одному формату
-    $dateObj = DateTime::createFromFormat('d.m.Y H:i:s', $date);
-    if ($dateObj) {
-        $normalizedDate = $dateObj->format('Y-m-d');
-    } else {
-        $normalizedDate = $date;
-    }
-    
-    return $receiptNumber . '_' . $normalizedDate;
-}
-
-/**
- * Определяет название для сделки на основе данных API
- */
-function determineDealTitle($apiPurchaseData, $cardNumber, $dateManager) {
-    $receiptNumber = $apiPurchaseData['receipt_number'] ?? '';
-    $date = $apiPurchaseData['date'] ?? '';
-    $hasItems = $apiPurchaseData['has_items'] ?? false;
-    
-    // Если не указан номер карты, берем из данных API
-    if (empty($cardNumber)) {
-        $cardNumber = $apiPurchaseData['card_number'] ?? '';
-    }
-    
-    if ($hasItems) {
-        // С товарами - название для продажи
-        return 'Продажа №' . $receiptNumber . ' от ' . $date;
-    } else {
-        // Без товаров - название для начального остатка
-        if (!empty($cardNumber)) {
-            return 'Внесение начального остатка по карте ' . $cardNumber;
-        } else {
-            return 'Внесение начального остатка №' . $receiptNumber . ' от ' . $date;
-        }
-    }
-}
-
-/**
- * Обновляет название сделки в Bitrix
- */
-function updateDealTitle($dealId, $newTitle, $logger) {
-    try {
-        $deal = new \CCrmDeal(false);
-        $updateFields = [
-            'TITLE' => $newTitle
-        ];
-        
-        $result = $deal->Update($dealId, $updateFields, true, true);
-        
-        if ($result) {
-            $logger->logSuccess('deal_title_update', $dealId, "Название сделки обновлено", [
-                'old_title' => '', // Можно добавить если нужно
-                'new_title' => $newTitle
-            ]);
-            return true;
-        } else {
-            $error = method_exists($deal, 'GetLAST_ERROR') ? $deal->GetLAST_ERROR() : 'Неизвестная ошибка';
-            $logger->logGeneralError('deal_title_update', $dealId, "Ошибка обновления названия: " . $error);
-            return false;
-        }
-        
-    } catch (Exception $e) {
-        $logger->logGeneralError('deal_title_update', $dealId, "Исключение при обновлении названия: " . $e->getMessage());
-        return false;
-    }
-}
-
-/**
- * Action для принудительного обновления названий всех сделок (для отладки)
- */
-function forceUpdateAllDealTitles() {
-    $logger = new JsonLogger();
-    $dateManager = new DateManager();
-    
-    echo "🔄 Принудительное обновление всех названий сделок...\n<br>";
+function findDuplicateDeals() {
+    $duplicates = [];
     
     try {
         // Получаем все сделки
         $deals = DealTable::getList([
-            'select' => ['ID', 'TITLE', 'UF_CRM_1761200496'],
-            'limit' => 5000
+            'select' => ['ID', 'TITLE', 'COMMENTS', 'DATE_CREATE'],
+            'order' => ['TITLE' => 'ASC', 'DATE_CREATE' => 'DESC']
         ])->fetchAll();
         
-        echo "📊 Получено сделок: " . count($deals) . "\n<br>";
-        
-        $results = [
-            'updated' => [],
-            'skipped' => [],
-            'errors' => []
-        ];
-        
-        // Получаем все покупки из API для анализа
-        $apiPurchases = getAllPurchasesFromApi();
-        $apiPurchasesByReceipt = groupApiPurchasesByReceipt($apiPurchases);
-        
+        // Группируем сделки по названию
         foreach ($deals as $deal) {
-            $dealId = $deal['ID'];
-            $currentTitle = $deal['TITLE'] ?? '';
-            $cardNumber = $deal['UF_CRM_1761200496'] ?? '';
-            
-            // Пытаемся извлечь номер чека из названия
-            $receiptNumber = extractReceiptNumberFromTitle($currentTitle);
-            
-            // Ищем в API по номеру чека
-            $foundInApi = false;
-            $apiData = null;
-            
-            if ($receiptNumber) {
-                foreach ($apiPurchasesByReceipt as $key => $apiPurchase) {
-                    if (strpos($key, $receiptNumber) !== false) {
-                        $foundInApi = true;
-                        $apiData = $apiPurchase;
-                        break;
-                    }
+            $title = trim($deal['TITLE']);
+            if (!empty($title)) {
+                if (!isset($duplicates[$title])) {
+                    $duplicates[$title] = [];
                 }
-            }
-            
-            if ($foundInApi && $apiData) {
-                // Определяем новое название на основе данных API
-                $newTitle = determineDealTitle($apiData, $cardNumber, $dateManager);
-            } else {
-                // Если не нашли в API, генерируем по шаблону
-                $newTitle = generateDealTitleFromCurrent($currentTitle, $cardNumber);
-            }
-            
-            // Обновляем если название изменилось
-            if ($currentTitle !== $newTitle) {
-                $updateResult = updateDealTitle($dealId, $newTitle, $logger);
-                
-                if ($updateResult) {
-                    $results['updated'][] = [
-                        'deal_id' => $dealId,
-                        'old_title' => $currentTitle,
-                        'new_title' => $newTitle
-                    ];
-                    echo "✅ Обновлена сделка ID: {$dealId}\n<br>";
-                } else {
-                    $results['errors'][] = [
-                        'deal_id' => $dealId,
-                        'error' => 'Ошибка обновления'
-                    ];
-                }
-            } else {
-                $results['skipped'][] = [
-                    'deal_id' => $dealId,
-                    'reason' => 'Название не изменилось'
-                ];
+                $duplicates[$title][] = $deal;
             }
         }
         
-        echo "\n=== РЕЗУЛЬТАТЫ ===\n<br>";
-        echo "Обновлено: " . count($results['updated']) . "\n<br>";
-        echo "Пропущено: " . count($results['skipped']) . "\n<br>";
-        echo "Ошибок: " . count($results['errors']) . "\n<br>";
+        // Фильтруем только группы с дубликатами (больше 1 сделки)
+        $duplicateGroups = [];
+        foreach ($duplicates as $title => $group) {
+            if (count($group) > 1) {
+                $duplicateGroups[$title] = $group;
+            }
+        }
+        
+        return $duplicateGroups;
+        
+    } catch (Exception $e) {
+        throw new Exception("Ошибка поиска дубликатов: " . $e->getMessage());
+    }
+}
+
+/**
+ * Обрабатывает группу дубликатов
+ */
+function processDuplicateGroup($deals) {
+    $result = [
+        'deleted' => 0,
+        'kept' => 0
+    ];
+    
+    try {
+        // 1. Ищем сделку с комментарием
+        $dealWithComment = null;
+        foreach ($deals as $deal) {
+            if (!empty($deal['COMMENTS'])) {
+                $dealWithComment = $deal;
+                break;
+            }
+        }
+        
+        // 2. Если есть сделка с комментарием, удаляем все остальные
+        if ($dealWithComment) {
+            $keepId = $dealWithComment['ID'];
+            echo "✅ Найдена сделка с комментарием: ID {$keepId}\n<br>";
+            
+            foreach ($deals as $deal) {
+                if ($deal['ID'] != $keepId) {
+                    if (deleteDeal($deal['ID'])) {
+                        $result['deleted']++;
+                        echo "  Удалена сделка ID: {$deal['ID']}\n<br>";
+                    } else {
+                        echo "  ❌ Ошибка удаления сделки ID: {$deal['ID']}\n<br>";
+                    }
+                } else {
+                    $result['kept']++;
+                }
+            }
+        } 
+        // 3. Если нет сделок с комментариями, оставляем самую новую
+        else {
+            // Сортируем по дате создания (самая новая первая)
+            usort($deals, function($a, $b) {
+                return strtotime($b['DATE_CREATE']) - strtotime($a['DATE_CREATE']);
+            });
+            
+            $keepId = $deals[0]['ID'];
+            echo "ℹ️  Нет сделок с комментариями, оставляем самую новую: ID {$keepId}\n<br>";
+            
+            // Удаляем все, кроме самой новой
+            for ($i = 1; $i < count($deals); $i++) {
+                if (deleteDeal($deals[$i]['ID'])) {
+                    $result['deleted']++;
+                    echo "  Удалена сделка ID: {$deals[$i]['ID']}\n<br>";
+                } else {
+                    echo "  ❌ Ошибка удаления сделки ID: {$deals[$i]['ID']}\n<br>";
+                }
+            }
+            $result['kept'] = 1;
+        }
+        
+        return $result;
+        
+    } catch (Exception $e) {
+        throw new Exception("Ошибка обработки группы: " . $e->getMessage());
+    }
+}
+
+/**
+ * Удаляет сделку
+ */
+function deleteDeal($dealId) {
+    try {
+        $deal = new \CCrmDeal(false);
+        $result = $deal->Delete($dealId);
+        
+        if ($result) {
+            return true;
+        } else {
+            error_log("Ошибка удаления сделки ID: {$dealId}");
+            return false;
+        }
+        
+    } catch (Exception $e) {
+        error_log("Исключение при удалении сделки {$dealId}: " . $e->getMessage());
+        return false;
+    }
+}
+
+
+/**
+ * Обновляет свойство property68 (nim_photo1) у товара
+ */
+function updateProductProperty68($productId, $nimPhoto1) {
+    try {
+        $result = CRest::call('catalog.product.update', [
+            'id' => $productId,
+            'fields' => [
+                'property68' => ['value' => $nimPhoto1]
+            ]
+        ]);
+        print_r($result);
+        return isset($result['result']) && $result['result'] === true;
+        
+    } catch (Exception $e) {
+        error_log("Ошибка при обновлении property68 товара {$productId}: " . $e->getMessage());
+        return false;
+    }
+}
+/**
+ * Основная функция обновления фото товаров
+ */
+function processUpdateProductPhotos() {
+    echo "🔄 Начинаем обновление фото товаров...\n<br>";
+    
+    try {
+        $logger = new JsonLogger();
+        $dateManager = new DateManager();
+        $imageProcessor = new ImageProcessor();
+        $entityManager = new EntityManager($dateManager, $imageProcessor, $logger);
+        
+        // Получаем обновленные данные товаров из API
+        echo "🔄 Получаем обновленные данные товаров из API...\n<br>";
+
+        $apiConfig = getApiCredentials();
+        $api_username = $apiConfig['username'];
+        $api_password = $apiConfig['password'];
+        $api_base_url = $apiConfig['base_url'];
+
+        $client = new ApiClient($api_username, $api_password, $api_base_url);
+        $itemsResult = $client->makeRequest('items', 'GET');
+
+        $apiItems = [];
+        if ($itemsResult['success'] && !empty($itemsResult['response'])) {
+            $apiItems = json_decode($itemsResult['response'], JSON_UNESCAPED_UNICODE) ?: [];
+            echo "✅ Получено товаров из API: " . count($apiItems) . "\n<br>";
+        } else {
+            echo "❌ Не удалось получить товары из API: " . ($itemsResult['error'] ?? 'Неизвестная ошибка') . "\n<br>";
+        }
+
+        // ====================================================
+        // НОВЫЙ КОД: Загрузка nim_photo1 из API в property68
+        // ====================================================
+        echo "\n🔄 Загрузка nim_photo1 из API в property68 Bitrix...\n<br>";
+        
+        if (!empty($apiItems)) {
+            $updateStats = [
+                'total_items' => count($apiItems),
+                'found_in_bitrix' => 0,
+                'updated' => 0,
+                'already_has_value' => 0,
+                'not_found' => 0,
+                'errors' => 0
+            ];
+            
+            // Создаем карту соответствия для быстрого поиска
+            $apiItemsMap = [];
+            foreach ($apiItems as $apiItem) {
+                $code = $apiItem['code'] ?? '';
+                if (!empty($code)) {
+                    $apiItemsMap[$code] = $apiItem;
+                }
+            }
+            
+            echo "Найдено уникальных кодов в API: " . count($apiItemsMap) . "\n<br>";
+
+            // Проходим по всем товарам из API
+            foreach ($apiItemsMap as $code => $apiItem) {
+                try {
+                    $nimPhoto1 = $apiItem['nim_photo1'] ?? '';
+                    
+                    // Если в API есть nim_photo1
+                    if (!empty($nimPhoto1)) {
+                        echo "  🔍 Код: {$code}, nim_photo1: {$nimPhoto1} - ";
+                        
+                        // Ищем товар в Bitrix по property64 (коду)
+                        $bitrixProduct = findProductByProperty64($code);
+                        
+                        if ($bitrixProduct) {
+                            $updateStats['found_in_bitrix']++;
+                            
+                            // Проверяем текущее значение property68
+                            $currentProperty68 = $bitrixProduct['property68']['value'] ?? '';
+                            
+                            if (empty($currentProperty68)) {
+                                // Обновляем property68
+                                $updateResult = updateProductProperty68($bitrixProduct['id'], $nimPhoto1);
+                                
+                                if ($updateResult) {
+                                    $updateStats['updated']++;
+                                    echo "✅ Обновлено property68\n<br>";
+                                } else {
+                                    $updateStats['errors']++;
+                                    echo "❌ Ошибка обновления\n<br>";
+                                }
+                            } else {
+                                $updateStats['already_has_value']++;
+                                echo "➡️ Уже есть значение: {$currentProperty68}\n<br>";
+                            }
+                        } else {
+                            $updateStats['not_found']++;
+                            echo "⚠️ Товар не найден в Bitrix\n<br>";
+                        }
+                    }
+                    
+                } catch (Exception $e) {
+                    $updateStats['errors']++;
+                    echo "❌ Исключение для кода {$code}: " . $e->getMessage() . "\n<br>";
+                }
+            }
+            
+            // Выводим статистику обновления
+            echo "\n=== СТАТИСТИКА ЗАГРУЗКИ NIM_PHOTO1 В PROPERTY68 ===\n<br>";
+            echo "Всего товаров в API: {$updateStats['total_items']}\n<br>";
+            echo "Найдено в Bitrix: {$updateStats['found_in_bitrix']}\n<br>";
+            echo "Обновлено: {$updateStats['updated']}\n<br>";
+            echo "Уже имели значение: {$updateStats['already_has_value']}\n<br>";
+            echo "Не найдено в Bitrix: {$updateStats['not_found']}\n<br>";
+            echo "Ошибок: {$updateStats['errors']}\n<br>";
+        }
+        
+        // ====================================================
+        // Продолжаем оригинальную обработку
+        // ====================================================
+        
+        // Создаем карту соответствия товаров из API для быстрого поиска
+        $apiItemsMap = [];
+        foreach ($apiItems as $apiItem) {
+            $code = $apiItem['code'] ?? '';
+            if (!empty($code)) {
+                $apiItemsMap[$code] = $apiItem;
+            }
+        }
+        echo "Создана карта соответствия API товаров: " . count($apiItemsMap) . " записей\n<br>";
+        
+        // Получаем все товары из Bitrix
+        $products = getAllProducts();
+        
+        if (empty($products)) {
+            echo "✅ Товары не найдены\n<br>";
+            return [
+                'success' => true,
+                'message' => 'Товары не найдены',
+                'total_products' => 0,
+                'updated' => 0,
+                'photos_added' => 0,
+                'errors' => 0,
+                'property68_updated' => $updateStats['updated'] ?? 0
+            ];
+        }
+        
+        $results = [
+            'total_products' => count($products),
+            'updated' => 0,
+            'photos_added' => 0,
+            'errors' => 0,
+            'details' => []
+        ];
+        
+        // Обрабатываем каждый товар
+        foreach ($products as $product) {
+            $productId = $product['id'] ?? 0;
+            $productName = $product['name'] ?? 'Без названия';
+            $property68 = $product['property68']['value'] ?? '';
+            $property79 = $product['property79']['value'] ?? '';
+            $property64 = $product['property64']['value'] ?? ''; // Код товара
+            
+            echo "\n--- Товар ID: {$productId} ---\n<br>";
+            echo "Название: {$productName}\n<br>";
+            echo "Код товара (property64): {$property64}\n<br>";
+            echo "property68 (nim_photo1): {$property68}\n<br>";
+            echo "property79 (product_image_filename): {$property79}\n<br>";
+            
+            try {
+                // Если нет property68 (nim_photo1), пытаемся найти в данных API
+                if (empty($property68) && !empty($property64) && isset($apiItemsMap[$property64])) {
+                    $apiItem = $apiItemsMap[$property64];
+                    $apiPhoto = $apiItem['nim_photo1'] ?? '';
+                    
+                    if (!empty($apiPhoto)) {
+                        echo "🔄 Найдено фото в API: {$apiPhoto}\n<br>";
+                        
+                        // Обновляем свойство property68 в товаре
+                        $updateResult = updateProductProperty68($productId, $apiPhoto);
+                        
+                        if ($updateResult) {
+                            echo "✅ Свойство property68 обновлено из API\n<br>";
+                            $property68 = $apiPhoto; // Обновляем значение для дальнейшей обработки
+                        } else {
+                            echo "❌ Ошибка обновления property68 из API\n<br>";
+                        }
+                    } else {
+                        echo "ℹ️ В API нет фото для этого товара\n<br>";
+                    }
+                }
+                
+                // Продолжаем стандартную обработку фото
+                if (empty($property79) && !empty($property68)) {
+                    echo "Добавляем фото из property68...\n<br>";
+                    
+                    // Добавляем фото из property68
+                    $result = addPhotoFromProperty68($productId, $property68, $entityManager);
+                    
+                    if ($result['success']) {
+                        $results['photos_added']++;
+                        $results['details'][] = [
+                            'product_id' => $productId,
+                            'action' => 'photo_added',
+                            'photo_source' => $property68,
+                            'message' => 'Фото успешно добавлено'
+                        ];
+                        echo "✅ Фото добавлено из: {$property68}\n<br>";
+                    } else {
+                        $results['errors']++;
+                        $results['details'][] = [
+                            'product_id' => $productId,
+                            'action' => 'photo_error',
+                            'error' => $result['error'],
+                            'photo_source' => $property68
+                        ];
+                        echo "❌ Ошибка добавления фото: {$result['error']}\n<br>";
+                    }
+                } else {
+                    echo "➡️ Пропускаем (нет property68 или уже есть фото)\n<br>";
+                    $results['details'][] = [
+                        'product_id' => $productId,
+                        'action' => 'skipped',
+                        'reason' => empty($property68) ? 'Пустое property68' : ($hasMainPhoto ? 'Уже есть фото' : 'Есть property79')
+                    ];
+                }
+                
+                $results['updated']++;
+                
+            } catch (Exception $e) {
+                $results['errors']++;
+                $results['details'][] = [
+                    'product_id' => $productId,
+                    'action' => 'exception',
+                    'error' => $e->getMessage()
+                ];
+                echo "❌ Исключение: " . $e->getMessage() . "\n<br>";
+            }
+        }
+        
+        echo "\n=== ИТОГИ ОБНОВЛЕНИЯ ФОТО ТОВАРОВ ===\n<br>";
+        echo "Всего товаров: {$results['total_products']}\n<br>";
+        echo "Обработано: {$results['updated']}\n<br>";
+        echo "Добавлено фото: {$results['photos_added']}\n<br>";
+        echo "Ошибок: {$results['errors']}\n<br>";
+        echo "Получено товаров из API: " . count($apiItems) . "\n<br>";
+        
+        // Логируем результаты
+        $logger->logGeneralError('update_product_photos', 'batch', "Обновление фото товаров завершено", array_merge($results, [
+            'api_items_count' => count($apiItems)
+        ]));
         
         return $results;
         
     } catch (Exception $e) {
-        echo "❌ Ошибка: " . $e->getMessage() . "\n<br>";
-        return ['success' => false, 'error' => $e->getMessage()];
+        echo "❌ Критическая ошибка: " . $e->getMessage() . "\n<br>";
+        return [
+            'success' => false,
+            'error' => $e->getMessage()
+        ];
     }
 }
-
 /**
- * Извлекает номер чека из названия сделки
+ * Находит товар по property64 (коду)
  */
-function extractReceiptNumberFromTitle($title) {
-    if (preg_match('/№\s*(\d+)/', $title, $matches)) {
-        return $matches[1];
-    }
-    
-    if (preg_match('/\b(\d{4,})\b/', $title, $matches)) {
-        // Предполагаем, что длинные числа - это номера чеков
-        if (strlen($matches[1]) >= 4) {
-            return $matches[1];
-        }
-    }
-    
-    return null;
-}
-
-/**
- * Генерирует название сделки из текущего названия
- */
-function generateDealTitleFromCurrent($currentTitle, $cardNumber) {
-    // Пытаемся определить, есть ли в названии упоминание о начальном остатке
-    if (stripos($currentTitle, 'остаток') !== false || 
-        stripos($currentTitle, 'внесение') !== false) {
+function findProductByProperty64($code) {
+    try {
+        $result = CRest::call('catalog.product.list', [
+            'filter' => [
+                '=property64' => $code,
+                'iblockId' => 14
+            ],
+            'select' => [
+                'id',
+                'name',
+                'property64',
+                'property68',
+                'property79'
+            ],
+            'limit' => 1
+        ]);
         
-        if (!empty($cardNumber)) {
-            return 'Внесение начального остатка по карте ' . $cardNumber;
-        } else {
-            return 'Внесение начального остатка';
+        if (isset($result['result']['products']) && !empty($result['result']['products'])) {
+            return $result['result']['products'][0];
         }
-    } else {
-        // Предполагаем, что это обычная продажа
-        $receiptNumber = extractReceiptNumberFromTitle($currentTitle);
-        if ($receiptNumber) {
-            return 'Продажа №' . $receiptNumber;
-        } else {
-            return $currentTitle; // Оставляем как есть
-        }
+        
+        return null;
+        
+    } catch (Exception $e) {
+        error_log("Ошибка при поиске товара по коду {$code}: " . $e->getMessage());
+        return null;
+    }
+}
+/**
+ * Получает все товары с нужными свойствами
+ */
+function getAllProducts() {
+    $allProducts = [];
+    $start = 0;
+    $batchSize = 50;
+    
+    try {
+        do {
+            // Получаем товары партиями по 50
+            $result = CRest::call('catalog.product.list', [
+                'select' => [
+                    'id',
+                    'name',
+                    'property68', // nim_photo1
+                    'property79', // product_image_filename
+                    'property64',
+                    'iblockId',
+                ],
+                'filter' => [
+                    'iblockId' => 14
+                ],
+                'order' => ['ID' => 'DESC'],
+                'start' => $start
+            ]);
+            print_r($result);
+            if (isset($result['result']["products"])) {
+                $products = $result['result']["products"];
+                $allProducts = array_merge($allProducts, $products);
+                echo "Получено товаров: " . count($products) . " (всего: " . count($allProducts) . ")\n<br>";
+                
+                // Проверяем, есть ли еще товары
+                $totalProducts = $result['total'] ?? 0;
+                
+                if ($totalProducts <= $start) {
+                    break; // Это последняя партия
+                }
+                
+                $start += $batchSize;
+            } else {
+                echo "Нет товаров в результате запроса\n<br>";
+                break;
+            }
+            
+            // Небольшая пауза между запросами
+            usleep(100000); // 0.1 секунды
+            
+        } while (true);
+        
+        echo "Всего получено товаров: " . count($allProducts) . "\n<br>";
+        return $allProducts;
+        
+    } catch (Exception $e) {
+        error_log("Ошибка при получении товаров: " . $e->getMessage());
+        return $allProducts; // Возвращаем то, что успели получить
     }
 }
 
-if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
-    processContactChangeApproval(); // Обработка подтверждений изменений
-    processClientsSync(); // Синхронизация клиентов
-} elseif(strpos($_SERVER['REQUEST_URI'], 'action=update') !== false){
-    processClientsSync();
-    // Проверяем наличие параметра date
-    if(isset($_REQUEST['date']) && !empty($_REQUEST['date'])) {
-        $timestamp = $_REQUEST['date'];
-        $fromDate = new DateTime();
-        $fromDate->setTimestamp($timestamp);
-        processRecentPurchases($fromDate);
-    } else {
+/**
+ * Добавляет фото из property68 к товару
+ */
+function addPhotoFromProperty68($productId, $photoFilename, $entityManager) {
+    try {
+        // Проверяем, есть ли фото в property68
+        if (empty($photoFilename)) {
+            return [
+                'success' => false,
+                'error' => 'Пустое имя файла в property68'
+            ];
+        }
+        
+        // Получаем конфигурацию медиа
+        $mediaConfig = getMediaConfig();
+        
+        if (empty($mediaConfig['base_url']) || empty($mediaConfig['photos_path'])) {
+            return [
+                'success' => false,
+                'error' => 'Не настроена конфигурация медиа'
+            ];
+        }
+        
+        // Формируем полный URL к фото
+        $imageUrl = $mediaConfig['base_url'] . $mediaConfig['photos_path'] . $photoFilename;
+        
+        echo "  📸 Пытаемся загрузить фото: {$imageUrl}\n<br>";
+        
+        // Обрабатываем изображение
+        $imageResult = $entityManager->processItemImage($imageUrl, $productId);
+        
+        if (!$imageResult) {
+            return [
+                'success' => false,
+                'error' => 'Не удалось обработать изображение'
+            ];
+        }
+        
+        // Обновляем товар с новым фото
+        $updateResult = updateProductWithPhoto($productId, $imageResult);
+        
+        if ($updateResult) {
+            return [
+                'success' => true,
+                'photo_url' => $imageUrl,
+                'message' => 'Фото успешно добавлено'
+            ];
+        } else {
+            return [
+                'success' => false,
+                'error' => 'Не удалось обновить товар'
+            ];
+        }
+        
+    } catch (Exception $e) {
+        return [
+            'success' => false,
+            'error' => $e->getMessage()
+        ];
     }
-} elseif(strpos($_SERVER['REQUEST_URI'], 'action=count') !== false){
-    countClientsSumm();
-} elseif(strpos($_SERVER['REQUEST_URI'], 'action=titles') !== false){
-    processDealTitleUpdate();
-} else {
-    $result = fetchAllData();
-
-echo "<pre>";
-print_r($result);
-echo "</pre>";
-	//main();
 }
 
+/**
+ * Обновляет товар с новым фото
+ */
+function updateProductWithPhoto($productId, $imageData) {
+    try {
+        $result = CRest::call('catalog.product.update', [
+            'id' => $productId,
+            'fields' => [
+                'detailPicture' => $imageData
+            ]
+        ]);
+        
+        return isset($result['result']) && $result['result'] === true;
+        
+    } catch (Exception $e) {
+        error_log("Ошибка при обновлении товара {$productId} с фото: " . $e->getMessage());
+        return false;
+    }
+}
 //$client = new ApiClient($api_username, $api_password, $api_base_url);
 //$itemsResult = $client->makeRequest('clients/changes&message_number=256832', 'DELETE',);
 ?>
