@@ -1656,16 +1656,103 @@ class ImageProcessor {
             'url' => $url
         ];
     }
+private function getResizedImageUrlNew($imageUrl, $maxWidth = 1000, $maxHeight = 1000) {
+    // Скачиваем изображение
+    $imageData = $this->downloadImage($imageUrl);
+    $originalImage = imagecreatefromstring($imageData['data']);
     
-    public function processImageForBitrix($imageUrl, $maxWidth = 1000, $maxHeight = 1000) {
+    if (!$originalImage) {
+        throw new Exception('Не удалось создать изображение из данных');
+    }
+    
+    // Получаем размеры оригинального изображения
+    $originalWidth = imagesx($originalImage);
+    $originalHeight = imagesy($originalImage);
+    
+    // Проверяем, нужно ли уменьшать
+    if ($originalWidth <= $maxWidth && $originalHeight <= $maxHeight) {
+        imagedestroy($originalImage);
+        return $imageUrl; // Возвращаем оригинальный URL, если размер уже подходит
+    }
+    
+    // Вычисляем новые размеры с сохранением пропорций
+    $ratio = $originalWidth / $originalHeight;
+    
+    if ($maxWidth / $maxHeight > $ratio) {
+        $newWidth = $maxHeight * $ratio;
+        $newHeight = $maxHeight;
+    } else {
+        $newWidth = $maxWidth;
+        $newHeight = $maxWidth / $ratio;
+    }
+    
+    $newWidth = (int)round($newWidth);
+    $newHeight = (int)round($newHeight);
+    
+    // Создаем новое изображение
+    $resizedImage = imagecreatetruecolor($newWidth, $newHeight);
+    
+    // Сохраняем прозрачность для PNG
+    imagesavealpha($resizedImage, true);
+    $transparent = imagecolorallocatealpha($resizedImage, 0, 0, 0, 127);
+    imagefill($resizedImage, 0, 0, $transparent);
+    
+    // Копируем и изменяем размер
+    imagecopyresampled($resizedImage, $originalImage, 0, 0, 0, 0, 
+                       $newWidth, $newHeight, $originalWidth, $originalHeight);
+    
+    // Сохраняем во временный файл
+    $tempFile = tempnam(sys_get_temp_dir(), 'resized_img_');
+    
+    // Определяем тип изображения и сохраняем
+    $imageInfo = getimagesizefromstring($imageData['data']);
+    $mimeType = $imageInfo['mime'] ?? 'image/jpeg';
+    
+    switch($mimeType) {
+        case 'image/jpeg':
+            imagejpeg($resizedImage, $tempFile, 85);
+            break;
+        case 'image/png':
+            imagepng($resizedImage, $tempFile, 8);
+            break;
+        case 'image/gif':
+            imagegif($resizedImage, $tempFile);
+            break;
+        case 'image/webp':
+            imagewebp($resizedImage, $tempFile, 85);
+            break;
+        default:
+            imagejpeg($resizedImage, $tempFile, 85);
+    }
+    
+    // Освобождаем память
+    imagedestroy($originalImage);
+    imagedestroy($resizedImage);
+    
+    // Читаем файл обратно
+    $resizedData = file_get_contents($tempFile);
+    
+    // Удаляем временный файл
+    unlink($tempFile);
+    
+    // Возвращаем base64 или создаем новый URL
+    // В зависимости от вашей логики, можно вернуть base64 или сохранить на сервере
+    // Вот вариант с возвратом base64 URL:
+    $base64 = 'data:' . $mimeType . ';base64,' . base64_encode($resizedData);
+    
+    return $base64;
+}
+
+    public function processImageForBitrix($imageUrl, $maxWidth = 1000, $maxHeight = 1000, $needResize = false) {
         try {
-            $resizedUrl = $this->getResizedImageUrl($imageUrl, $maxWidth, $maxHeight);
-            $imageData = $this->downloadImage($resizedUrl);
-            
+
+            if($needResize){
+                $imageUrl = $this->getResizedImageUrlNew($imageUrl, $maxWidth, $maxHeight);
+            }
+            $imageData = $this->downloadImage($imageUrl);
+
             return [
                 'success' => true,
-                'data' => $imageData,
-                'url' => $resizedUrl,
                 'base64' => base64_encode($imageData['data'])
             ];
             
@@ -1678,6 +1765,8 @@ class ImageProcessor {
         }
     }
 }
+
+
 
 class ApiClient {
     private $username;
@@ -2429,7 +2518,7 @@ class EntityManager {
         
         try {
             $imageResult = $this->imageProcessor->processImageForBitrix($imageUrl, 1000, 1000);
-            
+            print_r($imageResult);
             if ($imageResult['success']) {
                 return [
                     'fileData' => [
@@ -4521,7 +4610,7 @@ private function findCardByClientId($clientId) {
                 $syncResult = $this->syncSingleClient($clientData, $create);
                 if ($syncResult['status'] === 'created') {
                     $results['created'][] = $syncResult;
-                    //$this->findAndCreateDealsForClient($syncResult['bitrix_id'], $clientCode);
+                    $this->findAndCreateDealsForClient($syncResult['bitrix_id'], $clientCode);
                     echo "✅ Создан клиент: {$clientCode} (ID: {$syncResult['bitrix_id']})\n";
                 } elseif ($syncResult['status'] === 'updated') {
                     $results['updated'][] = $syncResult;
@@ -5446,7 +5535,7 @@ private function findCardByClientId($clientId) {
             
             // После обновления клиента синхронизируем все его карты и сделки
             if ($syncResult['status'] !== 'error') {
-                $this->findAndCreateDealsForAllClientCards($existingClient['ID'], $clientCode);
+                //$this->findAndCreateDealsForAllClientCards($existingClient['ID'], $clientCode);
             }
                         return $syncResult;
         }
@@ -6256,10 +6345,30 @@ if(strpos($_SERVER['REQUEST_URI'], 'action=clients') !== false){
 } elseif(strpos($_SERVER['REQUEST_URI'], 'action=add_photo') !== false) {
     processUpdateProductPhotos();
 } else {
+/*
     $result = fetchAllData();
     echo "<pre>";
     print_r($result);
     echo "</pre>";
+*/
+$products = getAllProducts();
+        
+if (empty($products)) {
+    echo "✅ Товары не найдены\n<br>";
+}
+
+foreach ($products as $product) {
+    $new_name = $product["property70"]["value"] ? $product["name"] . ' р. ' . $product["property70"]["value"] : null;
+    if(!empty($new_name)){
+        $result = CRest::call('catalog.product.update', [
+            'id' => $product['id'],
+            'fields' => [
+                'name' => $new_name
+            ]
+        ]);
+        usleep(100000); // 0.1 секунды
+    }
+}
 }
 
 // Добавляем функцию processDealDeduplication() перед последним закрывающим тегом
@@ -6449,21 +6558,21 @@ function deleteDeal($dealId) {
 
 
 /**
- * Обновляет свойство property68 (nim_photo1) у товара
+ * Обновляет свойство property79 (nim_photo1) у товара
  */
-function updateProductProperty68($productId, $nimPhoto1) {
+function updateProductproperty79($productId, $nimPhoto1) {
     try {
         $result = CRest::call('catalog.product.update', [
             'id' => $productId,
             'fields' => [
-                'property68' => ['value' => $nimPhoto1]
+                'property79' => ['value' => $nimPhoto1]
             ]
         ]);
         print_r($result);
         return isset($result['result']) && $result['result'] === true;
         
     } catch (Exception $e) {
-        error_log("Ошибка при обновлении property68 товара {$productId}: " . $e->getMessage());
+        error_log("Ошибка при обновлении property79 товара {$productId}: " . $e->getMessage());
         return false;
     }
 }
@@ -6478,7 +6587,7 @@ function processUpdateProductPhotos() {
         $dateManager = new DateManager();
         $imageProcessor = new ImageProcessor();
         $entityManager = new EntityManager($dateManager, $imageProcessor, $logger);
-        
+
         // Получаем обновленные данные товаров из API
         echo "🔄 Получаем обновленные данные товаров из API...\n<br>";
 
@@ -6497,11 +6606,11 @@ function processUpdateProductPhotos() {
         } else {
             echo "❌ Не удалось получить товары из API: " . ($itemsResult['error'] ?? 'Неизвестная ошибка') . "\n<br>";
         }
-
+        /*
         // ====================================================
-        // НОВЫЙ КОД: Загрузка nim_photo1 из API в property68
+        // НОВЫЙ КОД: Загрузка nim_photo1 из API в property79
         // ====================================================
-        echo "\n🔄 Загрузка nim_photo1 из API в property68 Bitrix...\n<br>";
+        echo "\n🔄 Загрузка nim_photo1 из API в property79 Bitrix...\n<br>";
         
         if (!empty($apiItems)) {
             $updateStats = [
@@ -6527,7 +6636,7 @@ function processUpdateProductPhotos() {
             // Проходим по всем товарам из API
             foreach ($apiItemsMap as $code => $apiItem) {
                 try {
-                    $nimPhoto1 = $apiItem['nim_photo1'] ?? '';
+                    $nimPhoto1 = $apiItem['product_image_filename'] ?? '';
                     
                     // Если в API есть nim_photo1
                     if (!empty($nimPhoto1)) {
@@ -6539,23 +6648,23 @@ function processUpdateProductPhotos() {
                         if ($bitrixProduct) {
                             $updateStats['found_in_bitrix']++;
                             
-                            // Проверяем текущее значение property68
-                            $currentProperty68 = $bitrixProduct['property68']['value'] ?? '';
+                            // Проверяем текущее значение property79
+                            $currentproperty79 = $bitrixProduct['property79']['value'] ?? '';
                             
-                            if (empty($currentProperty68)) {
-                                // Обновляем property68
-                                $updateResult = updateProductProperty68($bitrixProduct['id'], $nimPhoto1);
+                            if (empty($currentproperty79)) {
+                                // Обновляем property79
+                                $updateResult = updateProductproperty79($bitrixProduct['id'], $nimPhoto1);
                                 
                                 if ($updateResult) {
                                     $updateStats['updated']++;
-                                    echo "✅ Обновлено property68\n<br>";
+                                    echo "✅ Обновлено property79\n<br>";
                                 } else {
                                     $updateStats['errors']++;
                                     echo "❌ Ошибка обновления\n<br>";
                                 }
                             } else {
                                 $updateStats['already_has_value']++;
-                                echo "➡️ Уже есть значение: {$currentProperty68}\n<br>";
+                                echo "➡️ Уже есть значение: {$currentproperty79}\n<br>";
                             }
                         } else {
                             $updateStats['not_found']++;
@@ -6570,14 +6679,14 @@ function processUpdateProductPhotos() {
             }
             
             // Выводим статистику обновления
-            echo "\n=== СТАТИСТИКА ЗАГРУЗКИ NIM_PHOTO1 В PROPERTY68 ===\n<br>";
+            echo "\n=== СТАТИСТИКА ЗАГРУЗКИ NIM_PHOTO1 В property79 ===\n<br>";
             echo "Всего товаров в API: {$updateStats['total_items']}\n<br>";
             echo "Найдено в Bitrix: {$updateStats['found_in_bitrix']}\n<br>";
             echo "Обновлено: {$updateStats['updated']}\n<br>";
             echo "Уже имели значение: {$updateStats['already_has_value']}\n<br>";
             echo "Не найдено в Bitrix: {$updateStats['not_found']}\n<br>";
             echo "Ошибок: {$updateStats['errors']}\n<br>";
-        }
+        }*/
         
         // ====================================================
         // Продолжаем оригинальную обработку
@@ -6605,7 +6714,7 @@ function processUpdateProductPhotos() {
                 'updated' => 0,
                 'photos_added' => 0,
                 'errors' => 0,
-                'property68_updated' => $updateStats['updated'] ?? 0
+                'property79_updated' => $updateStats['updated'] ?? 0
             ];
         }
         
@@ -6632,22 +6741,22 @@ function processUpdateProductPhotos() {
             echo "property79 (product_image_filename): {$property79}\n<br>";
             
             try {
-                // Если нет property68 (nim_photo1), пытаемся найти в данных API
-                if (empty($property68) && !empty($property64) && isset($apiItemsMap[$property64])) {
+                // Если нет property79 (nim_photo1), пытаемся найти в данных API
+                if (empty($property79) && !empty($property64) && isset($apiItemsMap[$property64])) {
                     $apiItem = $apiItemsMap[$property64];
-                    $apiPhoto = $apiItem['nim_photo1'] ?? '';
+                    $apiPhoto = $apiItem['product_image_filename'] ?? '';
                     
                     if (!empty($apiPhoto)) {
                         echo "🔄 Найдено фото в API: {$apiPhoto}\n<br>";
                         
                         // Обновляем свойство property68 в товаре
-                        $updateResult = updateProductProperty68($productId, $apiPhoto);
+                        $updateResult = updateProductproperty79($productId, $apiPhoto);
                         
                         if ($updateResult) {
-                            echo "✅ Свойство property68 обновлено из API\n<br>";
-                            $property68 = $apiPhoto; // Обновляем значение для дальнейшей обработки
+                            echo "✅ Свойство property79 обновлено из API\n<br>";
+                            $property79 = $apiPhoto; // Обновляем значение для дальнейшей обработки
                         } else {
-                            echo "❌ Ошибка обновления property68 из API\n<br>";
+                            echo "❌ Ошибка обновления property79 из API\n<br>";
                         }
                     } else {
                         echo "ℹ️ В API нет фото для этого товара\n<br>";
@@ -6655,37 +6764,36 @@ function processUpdateProductPhotos() {
                 }
                 
                 // Продолжаем стандартную обработку фото
-                if (empty($property79) && !empty($property68)) {
-                    echo "Добавляем фото из property68...\n<br>";
-                    
-                    // Добавляем фото из property68
-                    $result = addPhotoFromProperty68($productId, $property68, $entityManager);
+                if (!empty($property79)) {
+                    echo "Добавляем фото из property79...\n<br>";
+
+                    $result = addPhotoFromProperty79($productId, $property79, $entityManager);
                     
                     if ($result['success']) {
                         $results['photos_added']++;
                         $results['details'][] = [
                             'product_id' => $productId,
                             'action' => 'photo_added',
-                            'photo_source' => $property68,
+                            'photo_source' => $property79,
                             'message' => 'Фото успешно добавлено'
                         ];
-                        echo "✅ Фото добавлено из: {$property68}\n<br>";
+                        echo "✅ Фото добавлено из: {$property79}\n<br>";
                     } else {
                         $results['errors']++;
                         $results['details'][] = [
                             'product_id' => $productId,
                             'action' => 'photo_error',
                             'error' => $result['error'],
-                            'photo_source' => $property68
+                            'photo_source' => $property79
                         ];
                         echo "❌ Ошибка добавления фото: {$result['error']}\n<br>";
                     }
                 } else {
-                    echo "➡️ Пропускаем (нет property68 или уже есть фото)\n<br>";
+                    echo "➡️ Пропускаем (нет property79 или уже есть фото)\n<br>";
                     $results['details'][] = [
                         'product_id' => $productId,
                         'action' => 'skipped',
-                        'reason' => empty($property68) ? 'Пустое property68' : ($hasMainPhoto ? 'Уже есть фото' : 'Есть property79')
+                        'reason' => empty($property79) ? 'Пустое property79' : ($hasMainPhoto ? 'Уже есть фото' : 'Есть property79')
                     ];
                 }
                 
@@ -6707,13 +6815,7 @@ function processUpdateProductPhotos() {
         echo "Обработано: {$results['updated']}\n<br>";
         echo "Добавлено фото: {$results['photos_added']}\n<br>";
         echo "Ошибок: {$results['errors']}\n<br>";
-        echo "Получено товаров из API: " . count($apiItems) . "\n<br>";
-        
-        // Логируем результаты
-        $logger->logGeneralError('update_product_photos', 'batch', "Обновление фото товаров завершено", array_merge($results, [
-            'api_items_count' => count($apiItems)
-        ]));
-        
+
         return $results;
         
     } catch (Exception $e) {
@@ -6773,15 +6875,17 @@ function getAllProducts() {
                     'property68', // nim_photo1
                     'property79', // product_image_filename
                     'property64',
+                    'property70',
                     'iblockId',
                 ],
                 'filter' => [
-                    'iblockId' => 14
+                    'iblockId' => 14,
+                    '!property70' => null
                 ],
                 'order' => ['ID' => 'DESC'],
-                'start' => $start
+                'start' => $start,
             ]);
-            print_r($result);
+
             if (isset($result['result']["products"])) {
                 $products = $result['result']["products"];
                 $allProducts = array_merge($allProducts, $products);
@@ -6815,15 +6919,15 @@ function getAllProducts() {
 }
 
 /**
- * Добавляет фото из property68 к товару
+ * Добавляет фото из property79 к товару
  */
-function addPhotoFromProperty68($productId, $photoFilename, $entityManager) {
+function addPhotoFromproperty79($productId, $photoFilename, $entityManager) {
     try {
-        // Проверяем, есть ли фото в property68
+        // Проверяем, есть ли фото в property79
         if (empty($photoFilename)) {
             return [
                 'success' => false,
-                'error' => 'Пустое имя файла в property68'
+                'error' => 'Пустое имя файла в property79'
             ];
         }
         
@@ -6838,7 +6942,7 @@ function addPhotoFromProperty68($productId, $photoFilename, $entityManager) {
         }
         
         // Формируем полный URL к фото
-        $imageUrl = $mediaConfig['base_url'] . $mediaConfig['photos_path'] . $photoFilename;
+        $imageUrl = $mediaConfig['base_url'] . 'product-images/' . $photoFilename;
         
         echo "  📸 Пытаемся загрузить фото: {$imageUrl}\n<br>";
         
